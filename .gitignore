@@ -1,0 +1,31 @@
+# 주의 — .gitignore는 줄 끝 주석을 지원하지 않는다.
+#    `runs/  # 로그`는 주석이 아니라 "runs/  # 로그"라는 이름을 찾는 패턴이 된다.
+#    주석은 반드시 제 줄에 둘 것.
+
+# 외부 저장소 (직접 clone)
+mujoco_menagerie/
+mujoco_playground/
+
+# 산출물 — 체크포인트와 영상은 git에 넣지 않는다
+runs/
+checkpoints/
+outputs/
+*.mp4
+*.gif
+*.pkl
+*.npz
+
+# Google Drive
+desktop.ini
+
+# python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# editor
+.vscode/
+.idea/
+.claude/
