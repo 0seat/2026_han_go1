@@ -29,11 +29,132 @@ playground의 Go1 joystick은 관측을 이렇게 조립한다 (명령이 맨 �
 
 from __future__ import annotations
 
+import contextlib
+import io
+import re
+
 import jax
 import jax.numpy as jp
 import numpy as np
 
 from ..llc import spec
+from . import maze
+
+
+_HFIELD_RE = re.compile(r"<hfield\b[^>]*?/>")
+
+
+#: 천장 전용 충돌 그룹. 왜 새 그룹이 필요한가 --
+#:
+#: `go1_mjx_feetonly.xml`은 `class="go1"` 기본값에서 `contype=0 conaffinity=0`으로
+#: **몸 전체의 충돌을 꺼두고**, 발 구만 `conaffinity=1`로 되살린다. 바닥은
+#: `contype=1`이라 발만 바닥과 부딪힌다. 몸통 충돌 geom은 XML에 있지만 죽어 있다.
+#: 그래서 천장을 그냥 놓으면 **로봇이 그대로 통과한다.**
+#:
+#: 몸통을 되살리되 기존 물리를 건드리지 않으려면 비트를 나눠야 한다.
+#:
+#:     바닥    contype=1  conaffinity=0
+#:     발      contype=0  conaffinity=1     ->  바닥과 부딪힘 (그대로)
+#:     천장    contype=2  conaffinity=0
+#:     몸통    contype=0  conaffinity=2     ->  천장과만 부딪힘
+#:
+#: 여기서 "몸통"은 trunk의 **박스 geom 하나**다. 다리까지 살리면 mjx가 실린더 x
+#: 박스 충돌을 구현하지 않아 모델 변환에서 죽는다.
+#:
+#: 몸통과 바닥은 `1 & 2 = 0`이라 여전히 안 부딪힌다. phase14가 학습된 조건이
+#: 그대로 유지된다. 발과 천장도 안 부딪히는데(2 & 1 = 0), 발을 천장까지 드는
+#: 상황은 드물어 감수한다.
+_CEILING_BIT = 2
+
+
+@contextlib.contextmanager
+def _hfield_resolution(nrow: int, ncol: int, ceiling=None, texture=None):
+    """씬 XML의 hfield 선언을 `maze`의 해상도로 바꿔 끼운다.
+
+    playground의 rough 씬은 `assets/hfield.png`(256 x 256, 20 x 20 m)로 격자를
+    정한다. 해상도도 맵 크기도 컴파일 때 확정되므로 모델을 만든 뒤에는 못 바꾼다
+    -- `hfield_data`의 크기가 이미 고정돼 있다. 그래서 **XML 단계에서** 갈아끼운다.
+    맵이 정사각형이 아니어도 여기서 따라간다.
+
+    씬 파일을 복사해 오지 않는 이유 -- 그 XML은 `<include>`와 상대경로로
+    menagerie 메시를 물고 있어서, 옮기면 경로가 전부 깨진다. playground의
+    자산 로더를 그대로 태우는 편이 안전하다.
+
+    치환이 안 되면 조용히 256으로 도는 대신 여기서 멈춘다. 해상도가 다르면
+    턱의 각도가 달라지고, 그것은 "정책이 턱을 못 넘는다"로 나타나서 원인을
+    찾기 어렵다.
+    """
+    import mujoco
+
+    original = mujoco.MjModel.from_xml_string
+    replaced = []
+
+    half_x = ncol * maze.CELL / 2
+    half_y = nrow * maze.CELL / 2
+
+    def patched(xml, assets=None, *args, **kwargs):
+        new, n1 = _HFIELD_RE.subn(
+            f'<hfield name="hfield" nrow="{nrow}" ncol="{ncol}" '
+            f'size="{half_x} {half_y} {maze.SPAN} {maze.BASE}"/>',
+            xml,
+        )
+        # 격자 값 0이 -DEPTH를 뜻하므로 바닥을 그만큼 내려야 평지가 z=0에 온다.
+        # **컴파일 뒤에 `geom_pos`를 고쳐서는 안 된다** -- worldbody에 붙은 정적
+        # geom은 `geom_xpos`가 컴파일 때 구워지고 `mj_forward`가 다시 계산하지
+        # 않는다. 여기서 한 번 걸렸다. XML에서 내려야 CPU와 mjx가 같이 움직인다.
+        new, n2 = re.subn(r'<geom name="floor"',
+                          f'<geom name="floor" pos="0 0 {-maze.DEPTH}"', new)
+
+        # 바닥 색. 씬은 바위 텍스처를 5 x 5로 반복해 깐다. 그 자산 바이트를
+        # 우리 그림으로 갈아 끼우고 반복을 1 x 1로 바꾸면, XML에 요소를 더하지
+        # 않고도 맵 전체에 한 장이 정확히 덮인다.
+        if texture is not None:
+            from PIL import Image
+            buf = io.BytesIO()
+            # 텍스처의 v축은 위에서 아래로 가고 hfield의 행은 -y에서 +y로 간다.
+            # 뒤집지 않으면 색만 남북이 바뀐 채로 깔린다.
+            Image.fromarray(np.asarray(texture, dtype=np.uint8)[::-1]).save(
+                buf, format="PNG")
+            assets = dict(assets or {})
+            assets["rocky_texture.png"] = buf.getvalue()
+            new = new.replace('texuniform="true" texrepeat="5 5"',
+                              'texuniform="false" texrepeat="1 1"')
+
+        if ceiling is not None and len(ceiling):
+            boxes = "\n".join(
+                f'    <geom name="ceiling_{i}" type="box" '
+                f'pos="{b[0]:.6f} {b[1]:.6f} {b[2]:.6f}" '
+                f'size="{b[3]:.6f} {b[4]:.6f} {b[5]:.6f}" '
+                f'contype="{_CEILING_BIT}" conaffinity="0" priority="1" '
+                f'friction="1.0" rgba="0.7 0.66 0.6 1"/>'
+                for i, b in enumerate(ceiling)
+            )
+            new, n3 = re.subn(r"</worldbody>", boxes + "\n  </worldbody>", new)
+            # 몸통 충돌을 천장 그룹에만 되살린다. 이 줄은 include 되는 로봇 XML에
+            # 있으므로 자산 dict 쪽을 고쳐야 한다.
+            #
+            # **몸통 박스 하나만 살린다.** `class="go1"` 기본값을 통째로 바꾸면
+            # 다리의 실린더 · 캡슐까지 살아나는데, mjx가 실린더 x 박스 충돌을
+            # 구현하지 않아 `put_model`이 NotImplementedError로 죽는다.
+            # 천장에 닿아야 하는 것은 몸통이므로 박스 하나로 충분하다.
+            assets = dict(assets or {})
+            key = "go1_mjx_feetonly.xml"
+            body = assets[key].decode("utf-8")
+            body, n4 = re.subn(
+                r'<geom class="collision" size="0\.125 0\.04 0\.057" type="box"/>',
+                f'<geom class="collision" size="0.125 0.04 0.057" type="box" '
+                f'conaffinity="{_CEILING_BIT}"/>', body)
+            assets[key] = body.encode("utf-8")
+            replaced.append(min(n1, n2, n3, n4))
+        else:
+            replaced.append(min(n1, n2))
+        return original(new, assets, *args, **kwargs)
+
+    mujoco.MjModel.from_xml_string = patched
+    try:
+        yield replaced
+    finally:
+        mujoco.MjModel.from_xml_string = original
 
 
 def _import_playground():
@@ -44,8 +165,30 @@ def _import_playground():
     return registry, go1_consts, Joystick
 
 
-def make(noise_level: float = 0.0, command_dim: int = spec.DIM):
+def make(noise_level: float = 0.0, command_dim: int = spec.DIM, terrain=None,
+         ceiling=None, texture=None):
     """11차원 명령 env를 만든다.
+
+    terrain -- `maze.heightfield()`가 낸 (NROW, NCOL) 격자. None이면 기존대로
+    평면 위에서 돈다.
+
+    ceiling -- `maze.ceilings()`가 낸 (N, 6) 천장 박스. 터널이 없으면 None.
+    **개수가 모델에 박히므로 배치 전체가 같아야 한다.**
+
+    texture -- `maze.texture()`가 낸 (NROW, NCOL, 3) 색 배열. 바닥 재질에 깔아
+    3D에서도 랜드 종류를 색으로 본다. 물리에는 영향이 없다.
+
+    평지 격자는 값이 전부 0이라 표면이 정확히 z=0에 놓인다 (CPU 레이캐스트로 확인).
+
+    주의 -- **평면과 평지 hfield의 성적을 그대로 비교하면 안 된다.** 표면
+    높이는 같지만 두 씬의 다른 설정이 함께 바뀐다.
+
+        scene_mjx_feetonly_flat_terrain     home z=0.278, friction 0.6, njmax 40
+        scene_mjx_feetonly_rough_terrain    home z=0.35,  friction 1.0, njmax 60
+
+    시작 높이가 7 cm 높고 마찰이 다르다. 무제어(액션 0)로 재면 평면에서는
+    서 있고 평지 hfield에서는 뒤집히는데, 그것은 지형이 아니라 낙하 높이 탓이다.
+    지형만 보려면 두 씬의 keyframe과 friction을 맞춰야 한다.
 
     noise_level=0.0이 기본인 이유 -- 스윕은 명령 하나당 응답 하나를 재는 것이고,
     관측 노이즈는 그 응답에 분산만 더한다. 시드 간 편차를 노이즈가 아니라 정책의
@@ -61,7 +204,21 @@ def make(noise_level: float = 0.0, command_dim: int = spec.DIM):
             self._default_command = jp.asarray(
                 spec.baseline_vector()[:self._command_dim], dtype=jp.float32
             )
-            super().__init__(task="flat_terrain", config=config)
+            # 지형이 있으면 hfield가 선언된 씬을 연다. playground의 Joystick은
+            # task가 "rough"로 시작할 때 naconmax · njmax를 키우는데, hfield는
+            # 접촉이 훨씬 많이 생기므로 그 설정이 필요하다.
+            if terrain is None:
+                super().__init__(task="flat_terrain", config=config)
+            else:
+                nrow, ncol = np.asarray(terrain).shape
+                with _hfield_resolution(nrow, ncol, ceiling, texture) as replaced:
+                    super().__init__(task="rough_terrain", config=config)
+                if sum(replaced) != 1:
+                    raise RuntimeError(
+                        f"씬 XML의 hfield 선언을 {sum(replaced)}개 바꿨습니다 (1개여야 합니다). "
+                        f"playground의 rough 씬이 바뀌었을 수 있습니다."
+                    )
+                self._install_terrain(terrain)
 
             # 접촉 센서 id. 부모 버전에 따라 이름이 달라 직접 만든다.
             self._floor_found_sensor = [
@@ -71,6 +228,30 @@ def make(noise_level: float = 0.0, command_dim: int = spec.DIM):
             self._floor_found_adr = np.asarray(
                 [self._mj_model.sensor_adr[i] for i in self._floor_found_sensor]
             )
+
+        # ---------- 지형 ----------
+        def _install_terrain(self, height):
+            """높이 격자를 모델에 굽는다. **`put_model` 전에 끝나야 한다.**
+
+            playground의 `Go1Env.__init__`은 XML을 읽은 직후 `mjx.put_model`을
+            부른다(base.py:67). 그 뒤에 `_mj_model`만 고치면 GPU에 올라간
+            모델은 안 바뀐다 -- 화면에는 지형이 보이는데 발은 평면을 딛는다.
+            그래서 여기서 다시 올린다.
+
+            `hfield_size`와 해상도는 `np.ndarray`라 배치 전체가 공유한다.
+            환경마다 다르게 할 수 있는 것은 `hfield_data`뿐이다.
+            """
+            from mujoco import mjx
+
+            m = self._mj_model
+            nrow, ncol = int(m.hfield_nrow[0]), int(m.hfield_ncol[0])
+            h = np.asarray(height, dtype=np.float32)
+            if h.shape != (nrow, ncol):
+                raise ValueError(
+                    f"높이 격자 {h.shape}가 모델의 hfield {(nrow, ncol)}와 다릅니다."
+                )
+            m.hfield_data[:] = h.reshape(-1)
+            self._mjx_model = mjx.put_model(m, impl=self._config.impl)
 
         # 부모의 자동 재샘플을 무력화.
         # playground 0.2.0의 시그니처는 `sample_command(rng, x_k)`이고 본체가
