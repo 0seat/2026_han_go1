@@ -14,7 +14,9 @@ os.environ.setdefault("GO1_CEIL", "1")
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--방식", nargs="*", default=["등반", "횡단"])
+    ap.add_argument("--방식", nargs="*",
+                    default=["등반", "횡단·오른쪽오르막", "횡단·왼쪽오르막"],
+                    help="등반 · 횡단·오른쪽오르막 · 횡단·왼쪽오르막")
     ap.add_argument("--속도", type=float, nargs="*", default=[0.3, 0.5, 0.9])
     ap.add_argument("--요각", type=float, default=0.0)
     ap.add_argument("--폭", type=int, default=7)

@@ -26,20 +26,44 @@ def main() -> None:
     ap.add_argument("--구간", type=int, default=6)
     ap.add_argument("--밀도", type=float, default=None)
     ap.add_argument("--턱빼기", action="store_true")
+    ap.add_argument("--경사", type=float, default=None,
+                    help="경사 각도를 이 판에서만 갈아끼운다 (기본은 maze.SLOPE_DEG). "
+                         "**다시 컴파일한다** -- 지형이 HLO 상수라 캐시 열쇠가 바뀐다")
     ap.add_argument("--역방향", action="store_true",
                     help="정답지를 뒤로도 훑어 차선을 두 배로")
     ap.add_argument("--판수", type=int, default=128)
+    ap.add_argument("--차선만", type=int, nargs="*", default=None,
+                    help="이 차선들에만 판을 몰아준다. **다시 컴파일한다** -- "
+                         "가중치가 reset 의 상수라 캐시 열쇠가 바뀐다")
+    ap.add_argument("--판씨앗", type=int, default=0,
+                    help="판 뽑는 씨앗. 프로세스를 나눌 때 서로 다르게 준다")
+    ap.add_argument("--배치", type=int, default=128,
+                    help="한 번에 굴리는 판 수. **캐시 열쇠라 바꾸면 다시 컴파일한다**")
     ap.add_argument("--스텝", type=int, default=None)
     ap.add_argument("--차선", type=int, nargs="*", default=None,
                     help="영상을 찍을 차선 번호. 안 주면 안 찍는다")
     ap.add_argument("--고를것", default="fail",
                     help="fail · 성공 · 시간초과 · 넘어짐")
     ap.add_argument("--표없이", action="store_true", help="측정을 건너뛴다")
+    ap.add_argument("--묶음", action="store_true",
+                    help="차선 표 대신 랜드 구성별 요약. 차선이 많을 때 쓴다")
     ap.add_argument("--출력", default=None)
+    ap.add_argument("--행저장", default=None,
+                    help="차선 표를 json 으로도 남긴다. 나중에 교차하려면 필요")
     args = ap.parse_args()
 
     from go1_nav import paths
     from go1_nav.hlc import lands, maze, measure, stage1, train
+
+    if args.경사 is not None:
+        # **`HIGH` 만 갈아끼운다.** `ELEVATION` 은 고정 상수라 안 따라오고, 그래서
+        # `SPAN` 이 그대로다 -- 관측 서명이 안 바뀐다는 뜻이다 (`maze.ELEVATION`
+        # 주석 참고). 각도를 재보려고 파일을 고쳤다 되돌리는 일을 없애려고 둔다.
+        import math
+        maze.HIGH = ((maze.CELLS_PER_TILE - 1) * maze.CELL
+                     * math.tan(math.radians(args.경사)))
+        assert maze.ELEVATION >= maze.LEVEL_MAX * maze.HIGH + maze.WALL_HEIGHT
+        print(f"  경사 {args.경사}도  단 높이 {maze.HIGH:.4f} m", flush=True)
 
     kinds = (tuple(k for k in maze.PLACED if k != maze.STEP)
              if args.턱빼기 else None)
@@ -54,11 +78,30 @@ def main() -> None:
 
     if not args.표없이:
         task = stage1.Task({"height": h, "ceiling": c, "plan": p})
+        if args.차선만:
+            # **판을 몰아준다.** 차선당 판이 두셋이면 도달 0.000 이 "못 간다"인지
+            # "운이 나빴다"인지 안 갈린다 -- 진짜 승률 0.5 도 3판 연속 실패가
+            # 12.5% 다. 의심 차선만 남기고 다시 재면 그 구분이 선다.
+            import numpy as _np
+            w = _np.zeros(task.n_lanes)
+            w[_np.asarray(args.차선만)] = 1.0
+            task.set_lane_weight(w)
+            print(f"  차선 {len(args.차선만)}개에만 판을 준다", flush=True)
         print(f"씨앗 {args.씨앗}  {args.모양[0]}x{args.모양[1]}  "
               f"구간 {args.구간}칸  차선 {task.n_lanes}", flush=True)
         t0 = time.time()
-        measure.lane_report(task, train.policy(params, task),
-                            n=args.판수, nsteps=args.스텝)
+        rows = measure.lane_report(task, train.policy(params, task),
+                                   n=args.판수, seed=args.판씨앗,
+                                   nsteps=args.스텝,
+                                   표=not args.묶음, batch=args.배치)
+        if args.행저장:
+            import json
+            Path(args.행저장).write_text(
+                json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+        if args.묶음:
+            print(measure.lane_spread(rows))
+            print(measure.direction_split(rows))
+            print(measure.lane_groups(rows))
         print(f"  측정 {time.time() - t0:.0f}초", flush=True)
 
     # **판을 하나만 세운다.** 차선은 seed 로 고른다 (`Task.seeds_for_lane`).

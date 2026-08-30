@@ -457,7 +457,8 @@ def _lane_name(plan, lane: int) -> str:
     return head + ("·".join(out[:3]) if out else "평지")
 
 
-def lane_report(task, policy, *, n: int = 128, seed: int = 0, nsteps=None):
+def lane_report(task, policy, *, n: int = 128, seed: int = 0, nsteps=None,
+                표: bool = True, batch: int = 128):
     """차선마다 도달·넘어짐·시간초과를 따로 낸다. **평균은 거짓말을 한다.**
 
     실측 -- 꺾임 뒤 장애물 판에서 전체 도달이 0.977 이었다. 차선이 넷이니
@@ -509,9 +510,29 @@ def lane_report(task, policy, *, n: int = 128, seed: int = 0, nsteps=None):
             "목표거리": st.metrics["목표거리"],
         }
 
+    # **폭을 늘리지 말고 여러 번 부른다.** vmap 폭이 HLO 에 들어가므로 폭이
+    # 곧 컴파일 캐시의 열쇠다. n 을 키우면 캐시가 통째로 빗나가고, 컴파일 자체도
+    # 폭에 따라 급히 무거워진다. 실측 -- n=128 은 컴파일까지 325 초인데 n=2832 는
+    # 21 분이 지나도 컴파일이 안 끝났고 24 코어 중 1.7 개만 돌았다.
+    #
+    # 조각으로 나누면 실행체 하나를 n/batch 번 재사용한다. 두 번째 부름부터는
+    # 컴파일이 없고, 다음 실행에서도 캐시가 맞는다.
+    run = jax.jit(jax.vmap(episode))
     keys = jax.random.split(jax.random.PRNGKey(int(seed)), int(n))
-    out = jax.jit(jax.vmap(episode))(keys)
-    out = {k: np.asarray(v) for k, v in out.items()}
+    batch = int(batch) if batch else int(n)
+    parts, t0 = [], time.perf_counter()
+    for i in range(0, int(n), batch):
+        k = keys[i:i + batch]
+        take = k.shape[0]
+        if take < batch:
+            # **마지막 조각도 폭을 맞춘다.** 안 맞추면 그 조각만 다시 컴파일한다.
+            k = jnp.concatenate([k, keys[:batch - take]])
+        parts.append((jax.device_get(run(k)), take))
+        print(f"    {min(i + batch, int(n)):>6} / {int(n)}판   "
+              f"{time.perf_counter() - t0:5.0f}초", flush=True)
+    out = {key: np.concatenate([np.asarray(part[key])[:take]
+                                for part, take in parts])
+           for key in parts[0][0]}
 
     rows = []
     for lane in range(task.n_lanes):
@@ -534,7 +555,10 @@ def lane_report(task, policy, *, n: int = 128, seed: int = 0, nsteps=None):
             "스텝": float(out["스텝"][m].mean()),
             "남은거리": float(out["목표거리"][m].mean()),
         })
-    print(lane_table(rows, total=float(out["도달"].mean())))
+    if 표:
+        print(lane_table(rows, total=float(out["도달"].mean())))
+    else:
+        print(f"\n  전체 도달  {float(out['도달'].mean()):.3f}")
     return rows
 
 
@@ -549,6 +573,126 @@ def lane_table(rows, total=None) -> str:
     if total is not None:
         out += ["", f"  전체 도달  {total:.3f}"]
     return "\n".join(out)
+
+
+def merge_rows(*row_lists):
+    """여러 프로세스가 낸 차선 표를 하나로 합친다. **판수로 가중한다.**
+
+    각 행의 숫자는 이미 그 프로세스의 판에 대한 평균이라, 판수를 무게로 주면
+    합친 평균이 전체 평균과 정확히 같다.
+
+    왜 프로세스를 나누는가 -- MJX 를 CPU 에서 vmap 128 로 굴리면 24 코어 중
+    1.5 개밖에 안 쓴다. 폭을 늘리면 캐시가 빗나가고 컴파일이 폭발하므로
+    (`lane_report` 의 batch 주석), 남는 코어는 **프로세스로** 쓴다. 컴파일이
+    캐시에 있으면 프로세스마다 다시 안 문다.
+
+    프로세스마다 `lane_report(seed=...)` 를 다르게 준다. 같으면 같은 판을
+    두 번 굴리는 것이라 판수만 늘고 정보는 안 는다.
+    """
+    import numpy as np
+
+    KEYS = ("도달", "넘어짐", "빠짐", "발산", "시간초과", "스텝", "남은거리")
+    bag: dict[int, list] = {}
+    for rows in row_lists:
+        for r in rows:
+            bag.setdefault(int(r["차선"]), []).append(r)
+
+    out = []
+    for lane in sorted(bag):
+        rs = bag[lane]
+        w = np.array([r["판수"] for r in rs], np.float64)
+        tot = w.sum()
+        merged = {"차선": lane, "랜드": rs[0]["랜드"], "판수": int(tot)}
+        for k in KEYS:
+            merged[k] = float(np.dot([r[k] for r in rs], w) / max(tot, 1.0))
+        out.append(merged)
+    return out
+
+def lane_spread(rows) -> str:
+    """차선별 도달률의 **분포**. 평균 하나로는 두 세계가 구분이 안 된다.
+
+        전 차선이 0.75            -> 아직 덜 배웠다. 더 돌리면 오른다
+        3/4 는 1.0, 1/4 는 0.0    -> 못 가는 차선이 따로 있다. 더 돌려도 그대로
+
+    전체 도달률은 둘 다 0.75 로 같다. PPO 곡선이 정체로 보일 때 어느 쪽인지
+    먼저 갈라야 한다 -- 뒤쪽이면 보상이나 스텝 수를 만져도 안 움직인다.
+    """
+    import numpy as np
+
+    v = np.array([r["도달"] for r in rows], np.float64)
+    w = np.array([r["판수"] for r in rows], np.float64)
+    edges = [0.0, 0.001, 0.25, 0.5, 0.75, 0.999, 1.001]
+    names = ["0.00", "~0.25", "~0.50", "~0.75", "~1.00", "1.00"]
+    out = ["", "  차선 도달률 분포", ""]
+    for i, name in enumerate(names):
+        m = (v >= edges[i]) & (v < edges[i + 1])
+        out.append(f"  {name:>6}  차선 {int(m.sum()):>4}  "
+                   f"({m.mean() * 100:5.1f}%)  판 {int(w[m].sum()):>5}")
+    out.append("")
+    out.append(f"  차선 평균 {v.mean():.3f}   중앙값 {np.median(v):.3f}")
+    return "\n".join(out)
+
+
+def lane_groups(rows, *, min_lanes: int = 4) -> str:
+    """차선을 **지형 포함 여부로** 묶는다. 차선 하나당 판이 몇 개뿐일 때 쓴다.
+
+    구성 문자열 그대로 묶으면 안 된다 -- 씨앗 0 의 64x64 는 차선 944 개에 구성이
+    295 가지라 대부분이 한 차선짜리 묶음이 된다. 그래서 "터널이 있는 차선",
+    "다리가 있는 차선" 처럼 **겹치게** 센다. 한 차선이 여러 줄에 들어간다.
+
+    방향도 함께 가른다. 같은 지형이라도 정 · 역 성적이 다르다는 것이 이미
+    실측돼 있다 (`_lane_name` 주석).
+    """
+    import re
+
+    import numpy as np
+
+    def kinds_of(name):
+        body = name[2:] if name.startswith("역·") else name
+        return {re.sub(r"[0-9]+$", "", t) for t in body.split("·") if t}
+
+    tags = sorted({k for r in rows for k in kinds_of(r["랜드"])})
+    lines = ["", "  지형    방향    차선   판수    도달  넘어짐   빠짐  시간초과   남은거리", ""]
+    agg = []
+    for tag in tags:
+        for 방향, want in (("정", False), ("역", True)):
+            rs = [r for r in rows
+                  if tag in kinds_of(r["랜드"])
+                  and r["랜드"].startswith("역·") == want]
+            if len(rs) < min_lanes:
+                continue
+            w = np.array([r["판수"] for r in rs], np.float64)
+            tot = max(w.sum(), 1.0)
+
+            def wm(key, rs=rs, w=w, tot=tot):
+                return float(np.dot([r[key] for r in rs], w) / tot)
+
+            agg.append((wm("도달"), tag, 방향, len(rs), int(w.sum()),
+                        wm("넘어짐"), wm("빠짐"), wm("시간초과"), wm("남은거리")))
+    for 도달, tag, 방향, n_lane, n_ep, fell, sunk, over, dist in sorted(agg):
+        lines.append(f"  {tag:<6} {방향:<4} {n_lane:>6}  {n_ep:>5}   {도달:.3f}   "
+                     f"{fell:.3f}  {sunk:.3f}     {over:.3f}     {dist:5.2f}")
+    lines.append("")
+    lines.append("  한 차선이 여러 줄에 들어간다. 합계는 차선 수와 다르다.")
+    return "\n".join(lines)
+
+
+def direction_split(rows) -> str:
+    """정방향 · 역방향으로만 가른 요약. **역방향이 천장인지 먼저 본다.**"""
+    import numpy as np
+
+    lines = ["", "  방향    차선   판수    도달  넘어짐   빠짐  시간초과", ""]
+    for tag, want in (("정방향", False), ("역방향", True)):
+        rs = [r for r in rows if r["랜드"].startswith("역·") == want]
+        if not rs:
+            continue
+        w = np.array([r["판수"] for r in rs], np.float64)
+        tot = max(w.sum(), 1)
+        def wm(key):
+            return float(np.dot([r[key] for r in rs], w) / tot)
+        lines.append(f"  {tag}  {len(rs):>6}  {int(w.sum()):>5}   {wm('도달'):.3f}   "
+                     f"{wm('넘어짐'):.3f}  {wm('빠짐'):.3f}     {wm('시간초과'):.3f}")
+    return "\n".join(lines)
 
 
 # ---------- 지도 그리기 ----------
@@ -735,6 +879,73 @@ def _yaw_of(quat: np.ndarray) -> np.ndarray:
 
 
 
+def obstacle_test(kinds, speeds, *, width: int = 3, nsteps: int = 400,
+                  seed: int = 0, checkpoint=None, verbose: bool = True):
+    """장애물 한 칸을 **LLC 단독으로** 정면 통과한다. 한계인지 아닌지만 본다.
+
+    `ramp_test` 와 같은 틀이다 -- 미로와 같은 생성기(`lands.obstacle_corridor`)가
+    지형을 만들고, 상위 제어기 없이 고정 명령으로 밀어 넣는다. 차이가 나면
+    그것은 그 지형 자체의 차이다.
+
+    **왜 필요한가** -- 턱은 `STEP_HEIGHT = 0.06` 이 실측 한계라는 근거로 미로에서
+    뺐다. 그런데 `ROCK_HEIGHT` 는 0.14 로 그 2.3 배인데 같은 실측을 거친 적이
+    없다. 미로 표에서 돌 칸이 늘수록 도달이 0.966 -> 0.697 로 무너지고 실패가
+    넘어짐이라, 이것이 LLC 한계인지 HLC 미학습인지 갈라야 한다.
+
+    통과 판정은 안 한다. **얼마나 갔고 넘어졌는가**만 낸다 -- 판정선을 두면
+    복도 길이가 답을 정해 버린다.
+    """
+    ckpt = checkpoint
+    if ckpt is None:
+        from .. import paths
+        ckpt = paths.llc()
+
+    rows = []
+    t0 = time.perf_counter()
+    for kind in kinds:
+        k = maze.NAMES_EN.get(kind, str(kind)) if isinstance(kind, int) else kind
+        code = kind if isinstance(kind, int) else getattr(maze, str(kind))
+        height, _, plan = lands.obstacle_corridor(
+            code, level_after=0, axis=maze.RUN_X, width=int(width))
+        env = hlc_env.make(terrain=height)
+        policy_fn = loader.load_policy(ckpt, loader.env_observation_size(env))
+        for v in speeds:
+            command = list(spec.BASE_VECTOR)
+            command[spec.index("vx")] = float(v)
+            track, fell = _slope_rollout(env, policy_fn, command, nsteps, seed)
+            row = {"랜드": maze.NAMES.get(code, str(code)), "속도": float(v),
+                   "스텝": int(len(track)), "넘어짐": int(fell),
+                   "전진": round(float(track[-1, 0] - track[0, 0]), 2),
+                   "옆으로": round(float(track[-1, 1] - track[0, 1]), 2),
+                   "최저z": round(float(track[:, 2].min()), 3)}
+            rows.append(row)
+            if verbose:
+                mark = "넘어짐" if fell >= 0 else "  버팀"
+                print(f"  {row['랜드']}  vx {v:.1f}  {mark}  "
+                      f"전진 {row['전진']:+6.2f} m  옆으로 {row['옆으로']:+6.2f} m  "
+                      f"최저z {row['최저z']:.3f}  ({row['스텝']}스텝)", flush=True)
+        del env
+    if verbose:
+        print(f"  ({time.perf_counter() - t0:.0f}초)")
+    return rows
+
+
+def obstacle_table(rows) -> str:
+    """`obstacle_test` 의 행들을 표로. 행이 랜드, 열이 속도다."""
+    speeds = sorted({r["속도"] for r in rows})
+    kinds = list(dict.fromkeys(r["랜드"] for r in rows))
+    out = ["", "장애물 한 칸  (LLC 단독, 정면 통과. x 전진 m)", "",
+           "  랜드   " + "  ".join(f"{v:>7.1f}" for v in speeds)]
+    for k in kinds:
+        cells = []
+        for v in speeds:
+            r = next((r for r in rows if r["랜드"] == k and r["속도"] == v), None)
+            cells.append("      X" if r is None or r["넘어짐"] >= 0
+                         else f"{r['전진']:>+7.2f}")
+        out.append(f"  {k:<5}  " + "  ".join(cells))
+    out += ["", "  X 는 넘어짐."]
+    return "\n".join(out)
+
 def ramp_test(modes, speeds, *, width: int = 7, nsteps: int = 400, seed: int = 0,
               yaw_cmd: float = 0.0, checkpoint=None, verbose: bool = True):
     """경사 한 칸을 **오르는 것과 가로지르는 것**을 나란히 잰다.
@@ -790,9 +1001,20 @@ def ramp_test(modes, speeds, *, width: int = 7, nsteps: int = 400, seed: int = 0
         i = int(np.clip((y + ey / 2) / ey * h, 0, h - 1))
         return float(height[i, j]) * maze.SPAN - maze.DEPTH
 
+    # **횡단은 좌우 두 쪽을 다 재야 한다.** 사면이 로봇의 왼쪽에 있느냐
+    # 오른쪽에 있느냐는 지형이 아니라 로봇 쪽 사정이고, 대칭이면 같아야 한다.
+    # 미로 실측에서 이 둘이 도달 0.031 대 0.767 로 갈렸기 때문에 대조가 필요하다.
+    # 경사는 +x 로 오르므로 북(+y)을 보면 오르막이 오른쪽, 남(-y)을 보면 왼쪽이다.
+    HEADING = {"등반": 0.0, "횡단·오른쪽오르막": np.pi / 2,
+               "횡단·왼쪽오르막": -np.pi / 2}
+    ALIAS = {"횡단": "횡단·오른쪽오르막"}
+    modes = [ALIAS.get(m, m) for m in modes]
+
     for mode in modes:
-        xy = (0.0, 0.0) if mode == "등반" else (ramp_x, y0)
-        yaw0 = 0.0 if mode == "등반" else np.pi / 2
+        assert mode in HEADING, f"모르는 방식 {mode}. {tuple(HEADING)} 중에서 고르세요"
+        xy = (0.0, 0.0) if mode == "등반" else (ramp_x, y0 if "오른쪽" in mode
+                                               else -y0)
+        yaw0 = HEADING[mode]
         # **몸통을 그 자리 지면만큼 띄운다.** keyframe 의 z 는 평지 기준이라
         # 경사 중턱에서 출발시키면 땅에 박힌 채로 시작한다.
         z0 = ground_at(*xy)
@@ -804,12 +1026,14 @@ def ramp_test(modes, speeds, *, width: int = 7, nsteps: int = 400, seed: int = 0
                                          heading=yaw0, start_xy=xy, z_offset=z0)
             # 나아가야 하는 축. 등반은 x, 횡단은 y 다.
             k = 0 if mode == "등반" else 1
+            # 남쪽을 보고 횡단하면 전진이 -y 다. 부호를 맞춰야 두 쪽을 견준다.
+            sgn = -1.0 if mode == "횡단·왼쪽오르막" else 1.0
             row = {
                 "방식": mode,
                 "속도": float(v),
                 "스텝": int(len(track)),
                 "넘어짐": int(fell),
-                "전진": round(float(track[-1, k] - track[0, k]), 2),
+                "전진": round(sgn * float(track[-1, k] - track[0, k]), 2),
                 # 옆으로 밀린 양. 횡단이면 이것이 사면 아래로 흘러내린 거리다.
                 "옆으로": round(float(track[-1, 1 - k] - track[0, 1 - k]), 2),
                 "고도": round(float(track[:, 2].max() - track[0, 2]), 2),
