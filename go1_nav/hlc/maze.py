@@ -143,6 +143,29 @@ LEVEL_MAX = 2               #: 높이 단 상한. 0, 1, 2 -> 세 단
 #     0    단방향 간선 평균 5.6개,  있는 미로 169/200
 #     1    단방향 간선 평균 2.9개,  있는 미로 108/200
 HILL_PAD = 0
+
+#: 언덕 밖에서 열을 하나 옮길 때 행이 바뀌는 **최대 칸수.**
+#:
+#: 전에는 여기가 없었고 `rng.choice(0..ty-1)` 로 **전체 높이에서 균등하게**
+#: 다시 뽑았다. 그 규칙은 ty=8 을 전제로 쓰인 것이다 -- 평균 3칸 점프라
+#: 적당한 지그재그가 나왔다. ty 를 64 로 키우면 평균 21칸이 되어 무너진다.
+#:
+#: 실측 (64x64, 씨앗 2). 세로 점프가 그대로 두 가지를 다 망가뜨렸다.
+#:
+#:     직진 길이가 이봉    1칸 66개(가로 이동) 와 12칸 19개, 최대 55칸
+#:     경사 띠 29칸        경사 열 하나 안에서 행을 28칸 옮긴 것이다.
+#:                         경사 열은 열 전체가 경사라 그 이동이 전부 경사 위다
+#:     맵 덮개 14.6%       경로가 빗살 모양이라 열마다 세로 한 줄만 쓴다
+#:
+#: **둘의 원인이 하나다.** 점프를 묶으면 같이 풀린다.
+#:
+#: 값의 근거 -- 5칸이면 10 m 다. `lands.maze_segments` 의 기본 구간이 6칸(12 m)
+#: 이므로 차선 하나에 꺾임이 한두 번 들어간다. 더 줄이면 조주 거리가 사라지고,
+#: 더 키우면 다시 긴 직진이 생긴다.
+#:
+#: **이 값이 지도 모양을 정한다.** 세로가 `2*WEAVE` 보다 훨씬 크면 경로가
+#: 그 띠 안에서만 놀아 나머지를 안 쓴다. 세로 12~16, 가로는 원하는 차선 수만큼.
+WEAVE = 5
 #: 0 위 최대 높이. 맨 위 단의 벽까지 담는다.
 #:
 #: **`HIGH` 에서 유도하지 않고 고정한다.** 원래는 `LEVEL_MAX * HIGH + 0.85` 였다.
@@ -492,21 +515,27 @@ def generate(seed: int = 0, shape: tuple[int, int] = (4, 10),
     for a, b in _runs(col_level, is_ramp):
         hill[a:b] = True
 
-    # 열마다 한 칸씩 흔들면 세로로 긴 맵에서 길이 한 줄에만 붙어 있게 된다.
-    # 가끔 크게 건너뛰어 맵 전체를 쓴다. 다만 **언덕 안에서는 행을 고정한다.**
-    # 언덕 밖에서는 **매 열 행을 바꾼다.** 조금씩만 흔들면 길이 거의 직선이라
-    # 세로로 지나는 구간이 안 생기고, 다리 · 터널을 세로로 놓을 자리도 없다.
-    # 지그재그가 많을수록 정답지가 맵을 넓게 쓰고 장애물 자리도 늘어난다.
+    # 열마다 행을 얼마나 옮기는가. **점프를 `WEAVE` 로 묶는다.**
+    #
+    # 세로 이동은 열 `c` 안에서 한 번에 일어난다 (아래 뚫기 반복문). 그래서
+    # 행 점프의 크기가 곧 **직진 구간의 길이**이고, 그 열이 경사 열이면 곧
+    # **경사 띠의 길이**다. 묶지 않으면 ty 가 커질수록 둘 다 같이 길어진다.
+    #
+    # 벽에서 되튄다 -- `clip` 으로 누르면 경로가 위아래 가장자리에 붙어 산다.
+    # 되튀면 띠가 높이 전체를 훑어 맵을 고르게 쓴다.
     rows = [int(rng.integers(0, ty))]
     for c in range(1, tx):
         if hill[c] and hill[c - 1]:
             # 언덕 안에서는 한 칸씩만. 크게 건너뛰면 언덕 직사각형이 세로 전체로
             # 퍼져서 같은 열이 전부 같은 높이가 되고 **단방향 간선이 사라진다.**
-            rows.append(int(np.clip(rows[-1] + rng.integers(-1, 2), 0, ty - 1)))
+            step = int(rng.integers(-1, 2))
         elif ty < 2:
-            rows.append(rows[-1])
+            step = 0
         else:
-            rows.append(int(rng.choice([r for r in range(ty) if r != rows[-1]])))
+            # 0 은 뺀다. 제자리면 그 열에 꺾임도 장애물 자리도 안 생긴다.
+            w = min(int(WEAVE), ty - 1)
+            step = int(rng.choice([d for d in range(-w, w + 1) if d != 0]))
+        rows.append(_reflect(rows[-1] + step, ty))
 
     on_path = np.zeros(shape, dtype=bool)
     travel: dict[tuple[int, int], set[int]] = {}
@@ -564,7 +593,20 @@ def generate(seed: int = 0, shape: tuple[int, int] = (4, 10),
     rng.shuffle(want)
     # 종류 수보다 자리가 많으면 나머지는 무작위다. 평지를 두 번 넣어 장애물
     # 밀도를 낮춘다 -- 정답지가 장애물로만 채워지면 조주 거리가 사라진다.
+    #
+    # **귀한 칸을 그것이 필요한 종류에 쓴다.** 다리 · 터널은 상판과 천장이 곧은
+    # 띠라 한 축으로만 지나는 칸에만 놓을 수 있다. 그 칸은 꺾임이 잦아질수록
+    # 줄어든다 -- `WEAVE` 를 넣기 전 51.8 % 에서 36.9 % 가 됐고, 그만큼 다리 ·
+    # 터널이 경로의 7.1 · 7.3 % 에서 5.3 · 5.0 % 로 밀렸다 (12x160, 씨앗 6개).
+    #
+    # 돌 · 거침 · 턱은 방향이 없어 꺾임 칸에도 놓을 수 있고, 아래 밀도 채우기가
+    # 실제로 거기서 공급한다. 그래서 한 축 칸에서는 **방향이 있는 종류에 무게를
+    # 더 준다.** 밀도 채우기가 꺼져 있으면(`density is None`) 돌 · 거침을 여기서
+    # 공급할 곳이 여기뿐이므로 무게를 안 준다.
+    locked = [k for k in want if k in (BRIDGE, TUNNEL)]
     fill = [FLAT, FLAT] + want
+    if locked and density is not None:
+        fill = fill + locked
     for i, (r, c) in enumerate(spots):
         k = want[i] if i < len(want) else int(rng.choice(fill))
         kind[r, c] = k
@@ -639,6 +681,20 @@ def generate(seed: int = 0, shape: tuple[int, int] = (4, 10),
             f"어긋난 것이므로 씨앗을 바꿔 넘기지 말 것."
         )
     return mz
+
+
+def _reflect(r: int, ty: int) -> int:
+    """`r` 을 [0, ty-1] 안으로 **되튀겨** 넣는다. 자르지 않는다.
+
+    자르면(`clip`) 경로가 가장자리에 달라붙는다 -- 위쪽에서 +5 를 뽑아도 0 에
+    머무르므로, 벽 근처에서 제자리걸음이 잦아지고 그만큼 지도를 덜 쓴다.
+    되튀면 가장자리가 거울이 되어 띠가 높이 전체를 오간다.
+    """
+    if ty <= 1:
+        return 0
+    period = 2 * (ty - 1)
+    r = int(r) % period
+    return r if r < ty else period - r
 
 
 def _runs(col_level: list[int], is_ramp: list[bool]) -> list[tuple[int, int]]:

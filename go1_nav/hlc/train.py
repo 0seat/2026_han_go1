@@ -189,15 +189,21 @@ def _check_brax_jax() -> None:
 
 
 def train(task, *, num_timesteps=20_000_000, num_envs=1024, num_evals=10,
-          seed=0, video_dir=None, render=False, video_steps=stage1.MAX_STEPS,
+          seed=0, save_dir=None, video_dir=None, render=False,
+          video_steps=stage1.MAX_STEPS,
           video_every=3, video_tries=3, video_stride=2,
           restore=None, progress=None,
           stop_at=1.0, stop_patience=2, stop_metric="eval/episode_도달",
           **overrides):
     """1단계 학습 한 판.
 
-    `video_dir` 에 기본값을 두지 않았다 -- 부르는 쪽이 어디에 남길지 정해야 한다.
-    `None` 을 **명시적으로** 넘기면 영상 없이 돈다. 그건 배선 시험용이다.
+    **저장 자리와 녹화 자리를 나눈다.** `save_dir` 이 체크포인트, `video_dir` 이
+    영상이다. 전에는 `video_dir` 하나가 둘을 겸했고, 렌더가 비싸서 그걸 비웠더니
+    **체크포인트까지 같이 꺼져 콜랩에서 9시간을 날렸다.** 이름이 영상인데 저장을
+    쥐고 있으면 그 함정을 피할 방법이 없다.
+
+    `save_dir` 을 안 주면 `video_dir` 을 쓴다 -- 옛 호출이 그대로 돈다.
+    둘 다 없으면 디스크에 아무것도 안 남는다. 그건 배선 시험용이다.
 
     `num_timesteps` 는 **HLC 스텝** 수다. LLC 스텝으로는 5배다 -- 2천만이면
     LLC 1억 스텝이고, phase18 의 한 스테이지(800만)보다 훨씬 크다. 처음에는
@@ -279,6 +285,8 @@ def train(task, *, num_timesteps=20_000_000, num_envs=1024, num_evals=10,
             raise _Stop
 
     seen = {"n": 0}
+    # 저장 자리. 안 주면 옛 호출과 같게 `video_dir` 로 떨어진다.
+    out_dir = save_dir if save_dir is not None else video_dir
 
     def on_params(step, make_policy, params):
         """**평가마다 파라미터를 저장하고**, 가끔 영상을 남긴다.
@@ -290,21 +298,20 @@ def train(task, *, num_timesteps=20_000_000, num_envs=1024, num_evals=10,
         때문에 런타임을 재시작해야 하는데, 그러면 메모리의 파라미터가 사라진다.
         **이걸로 1.47백만 스텝을 한 번 날렸다.** 그때는 저장이 아예 없었다.
         """
-        # 조기 종료가 이걸 되돌려 주므로 `video_dir` 여부와 무관하게 챙긴다.
+        # 조기 종료가 이걸 되돌려 주므로 자리 설정과 무관하게 챙긴다.
         held["params"], held["make_policy"] = params, make_policy
-        if video_dir is None:
-            return
         i, seen["n"] = seen["n"], seen["n"] + 1
         last = step >= int(num_timesteps)
 
         # 최신본은 늘 같은 이름으로 덮어쓴다. 되읽을 때 스텝 수를 몰라도 된다.
-        save(params, Path(video_dir) / "params_latest.pkl", quiet=True)
-        save(params, Path(video_dir) / f"params_{step:010d}.pkl", quiet=True)
+        if out_dir is not None:
+            save(params, Path(out_dir) / "params_latest.pkl", quiet=True)
+            save(params, Path(out_dir) / f"params_{step:010d}.pkl", quiet=True)
 
         # **저장과 녹화를 분리한다.** 렌더는 프레임당 1 초로 물리보다 비싸고,
         # GPU 를 놀린다. 파라미터가 드라이브에 남으므로 영상은 나중에 로컬 CPU 에서
         # `stage1.debug_video` 로 뽑는 편이 낫다 -- 보고 싶을 때만 돌리면 된다.
-        if not render:
+        if not render or video_dir is None:
             return
         if i % max(1, int(video_every)) and not last:
             return
@@ -340,8 +347,8 @@ def train(task, *, num_timesteps=20_000_000, num_envs=1024, num_evals=10,
         make_policy, params = held["make_policy"], held["params"]
         metrics = frames[-1][1] if frames else {}
     print(f"학습 {time.perf_counter() - t0:.0f}초", flush=True)
-    if video_dir is not None:
-        save(params, Path(video_dir) / "params_latest.pkl")
+    if out_dir is not None:
+        save(params, Path(out_dir) / "params_latest.pkl")
     return make_policy, params, metrics, frames
 
 
