@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import re
+import shutil
+from pathlib import Path
 
 import jax
 import jax.numpy as jp
@@ -130,6 +133,50 @@ def _hfield_resolution(nrow: int, ncol: int, ceiling=None, texture=None):
                 for i, b in enumerate(ceiling)
             )
             new, n3 = re.subn(r"</worldbody>", boxes + "\n  </worldbody>", new)
+
+            # **먼 천장은 계산하지 않는다.** mjx 는 충돌 쌍을 모델 컴파일 때
+            # 정적으로 펼치므로, 천장이 75 개면 로봇이 어디에 있든 매 스텝
+            # 몸통 x 천장 75 쌍을 전부 돌린다. 게다가 박스 x 박스라 mjx 충돌
+            # 중 제일 비싸다. 실측 (64x64, 로컬 CPU 1환경)
+            #
+            #     천장 5개  44.1 스텝/초        천장 75개  25.9 스텝/초
+            #
+            # `max_geom_pairs` 는 경계구 거리로 싸게 추린 뒤 **가까운 N 쌍에만**
+            # 충돌 함수를 돌린다 (`mjx/_src/collision_driver.py` 의 `collision`).
+            # 실측 -- 75 개를 그대로 두고 25.9 -> 38.9 스텝/초, **1.50 배**다.
+            # 터널은 하나도 안 잃는다.
+            #
+            # 천장이 적어도 손해가 없어 조건 없이 켠다.
+            #
+            #     천장  5개(64x64)  끔 39.6  켬 40.4
+            #     천장 10개         끔 39.2  켬 41.5
+            #     천장 20개         끔 44.1  켬 45.9
+            #     8x16 천장 5개     끔 40.8  켬 40.2
+            #
+            # **주의 — 이 값들은 정책을 태워 잰 것이다.** 0 행동으로 밟으면
+            # 로봇이 넘어지고, 그 뒤로는 지형이 아니라 **누운 자세**가 접촉
+            # 개수를 정한다. 그 자로 재서 "지도 크기가 2.31 배" "작은 판이
+            # 1.5 배 느려짐" 같은 틀린 결론을 여러 번 냈다. 스텝 비용을 잴 때는
+            # 정책을 태우고 넘어진 판을 버릴 것.
+            #
+            # **지형은 안 잘린다.** `_GEOM_NO_BROADPHASE` 가 hfield 와 plane 을
+            # 빼 준다. 이 모델의 충돌 그룹은 (박스, 박스) 75 쌍과 (hfield, 구)
+            # 4 쌍뿐이라, 잘리는 것은 천장 그룹 하나다.
+            #
+            # 4 인 이유 -- 터널 75 칸 중 67 칸이 외딴 한 칸이고 붙은 것도 2 칸이라
+            # 로봇 근처에 천장이 둘을 넘지 않는다. 4 는 여유분이다.
+            #
+            # **주의 —** 비트 단위로 같지는 않다. `top_k` 가 접촉 배열의 순서를
+            # 바꾸고 그것이 솔버의 합 순서를 바꾼다. 잘린 쌍은 멀어서 접촉이
+            # 없었으므로 물리가 아니라 반올림이 달라지는 것이지만, 넘어지는
+            # 중인 로봇은 그 차이를 증폭한다. 실측 3 판에서 도달 · 넘어짐은 모두
+            # 같고 스텝 수가 24 -> 27 로 갈린 판이 하나 있었다.
+            # **예전 영상은 그대로 재현되지 않는다.**
+            new, n5 = re.subn(
+                r"</mujoco>",
+                '<custom><numeric name="max_geom_pairs" data="4"/></custom>'
+                "</mujoco>", new)
+
             # 몸통 충돌을 천장 그룹에만 되살린다. 이 줄은 include 되는 로봇 XML에
             # 있으므로 자산 dict 쪽을 고쳐야 한다.
             #
@@ -145,7 +192,7 @@ def _hfield_resolution(nrow: int, ncol: int, ceiling=None, texture=None):
                 f'<geom class="collision" size="0.125 0.04 0.057" type="box" '
                 f'conaffinity="{_CEILING_BIT}"/>', body)
             assets[key] = body.encode("utf-8")
-            replaced.append(min(n1, n2, n3, n4))
+            replaced.append(min(n1, n2, n3, n4, n5))
         else:
             replaced.append(min(n1, n2))
         return original(new, assets, *args, **kwargs)
@@ -157,9 +204,53 @@ def _hfield_resolution(nrow: int, ncol: int, ceiling=None, texture=None):
         mujoco.MjModel.from_xml_string = original
 
 
+#: 저장소가 들고 다니는 로봇 에셋. `mujoco_playground` 가 여기를 보게 만든다.
+#:
+#: `<repo>/assets/mujoco_menagerie/unitree_go1` 12 MB 다. 통째 menagerie 는 훨씬
+#: 크지만 Go1 XML 이 참조하는 것은 이 폴더 하나뿐이라 그것만 담는다.
+ASSETS = Path(__file__).resolve().parents[2] / "assets" / "mujoco_menagerie"
+
+
+def _ensure_menagerie():
+    """로봇 메시를 제자리에 놓는다. **매 세션 clone 하지 않기 위해서다.**
+
+    `mujoco_playground` 는 메시를 패키지에 담지 않고 `mujoco_menagerie` 를 고정
+    커밋으로 clone 해서 쓴다. 그런데 clone 을 자동으로 하지 않아서, 없는 환경
+    (새 콜랩 세션 등)에서는 XML 의 상대경로가 허공을 가리키며 이렇게 죽는다.
+
+        ValueError: Error opening file
+        '../../../../../../mujoco_menagerie/unitree_go1/assets/trunk.stl'
+
+    메시지가 경로만 말하고 무엇을 해야 하는지는 안 말해 준다.
+
+    `ensure_menagerie_exists()` 를 부르면 되지만 **세션마다 다시 받는다.** 콜랩은
+    런타임이 초기화될 때마다 site-packages 가 날아가므로 매번 수 분이다. 그래서
+    저장소가 에셋을 들고 다니고, 여기서 심볼릭 링크만 건다.
+
+        1  이미 있으면 아무것도 안 한다            로컬은 여기서 끝난다
+        2  저장소 사본이 있으면 링크 (없으면 복사)  콜랩은 여기서 끝난다. 즉시
+        3  둘 다 없으면 playground 에게 맡긴다     clone. 마지막 수단
+    """
+    from mujoco_playground._src import mjx_env
+
+    target = Path(str(mjx_env.MENAGERIE_PATH))
+    if target.exists():
+        return
+    if ASSETS.is_dir():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(ASSETS, target, target_is_directory=True)
+        except OSError:
+            # 윈도우는 심볼릭 링크에 권한이 필요하다. 12 MB 라 복사해도 싸다.
+            shutil.copytree(ASSETS, target)
+        return
+    mjx_env.ensure_menagerie_exists()
+
+
 def _import_playground():
     """무거운 import를 함수 안으로. 로컬(JAX 없음)에서 spec만 읽을 수 있게."""
     from mujoco_playground import registry
+    _ensure_menagerie()
     from mujoco_playground._src.locomotion.go1 import go1_constants as go1_consts
     from mujoco_playground._src.locomotion.go1.joystick import Joystick
     return registry, go1_consts, Joystick
@@ -271,6 +362,53 @@ def make(noise_level: float = 0.0, command_dim: int = spec.DIM, terrain=None,
             덮어써서는 관측이 48D로 나온다 -- 실제로 여기서 한 번 걸렸다.
             """
             return self.with_command(super().reset(rng), self._default_command)
+
+        def reset_at(self, rng, xy=(0.0, 0.0), yaw=0.0, speed=0.0,
+                     z_offset=0.0):
+            """**자세를 지정해서** 리셋한다. 부모의 무작위 배치를 덮어쓴다.
+
+            playground의 `reset`은 위치를 U(-0.5, 0.5) m, 요각을 U(-pi, pi),
+            그리고 `qvel[0:6]`을 U(-0.5, 0.5)로 흔든다 (joystick.py). 설정으로
+            끄는 길이 없다. 그대로 두면
+
+                측정   복도를 따라 걷게 하려는데 로봇이 아무 쪽이나 보고 선다.
+                       실제로 여기서 한 번 걸렸다 -- 요각 -142도로 시작해 옆으로
+                       걸어 나갔고, 표에는 "턱을 못 넘었다"로 찍혔다
+                학습   랜드 A -> B 과제에서 진입 조건을 우리가 못 고른다
+
+            둘 다 자세를 우리가 정해야 한다. 그래서 **끄는 것이 아니라 덮어쓴다** --
+            부모의 리셋을 그대로 부르고 `qpos`/`qvel`만 갈아 끼운 뒤 다시
+            `mjx.forward`를 돌린다. 접촉과 센서가 새 자세에 맞게 다시 풀린다.
+
+            `speed`는 진행 방향 초기 속도다. 0이면 정지 출발, 0보다 크면 앞
+            랜드에서 달려 들어온 상황이 된다. 1단계 학습에서 이 인자를 흔든다.
+
+            `z_offset`은 몸통을 그만큼 띄운다. **keyframe의 z는 평지 기준이라
+            높은 자리에서 출발시키면 지형에 박힌다.** 경사 중턱에서 출발시키는
+            커리큘럼이 이 인자를 쓴다 -- x 2.6 의 지형이 0.57 m 인데 몸통을
+            0.35 에 놓으면 0.22 m 파묻힌 채로 시작한다.
+
+            기본값 0 이라 평지에서 출발하는 기존 호출은 그대로다. 부르는 쪽이
+            지형 높이를 알고 넘겨야 한다 -- 여기서는 높이 격자를 안 들고 있다.
+            """
+            from mujoco import mjx
+
+            state = self.reset(rng)
+            half = 0.5 * jp.asarray(yaw, dtype=jp.float32)
+            xy = jp.asarray(xy, dtype=state.data.qpos.dtype).reshape(2)
+
+            q = state.data.qpos.at[0:2].set(xy)
+            q = q.at[2].add(jp.asarray(z_offset, dtype=q.dtype))
+            # keyframe의 자세가 단위 쿼터니언이라 요 회전을 그대로 넣으면 된다.
+            q = q.at[3:7].set(jp.array([jp.cos(half), 0.0, 0.0, jp.sin(half)],
+                                       dtype=q.dtype))
+            v = state.data.qvel.at[0:6].set(0.0)
+            v = v.at[0].set(speed * jp.cos(yaw)).at[1].set(speed * jp.sin(yaw))
+
+            data = mjx.forward(self.mjx_model,
+                               state.data.replace(qpos=q, qvel=v))
+            return self.with_command(state.replace(data=data),
+                                     state.info["command"])
 
         # ---------- 명령 주입 ----------
         def with_command(self, state, command):

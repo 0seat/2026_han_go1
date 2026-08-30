@@ -35,7 +35,7 @@ Go1 사족보행 로봇의 계층 제어. 경로(nav)를 받아 상위 제어기
 랜드(2 m 정사각형)를 이어붙여 만든다. 랜드 하나가 장애물 하나다.
 
 ```
-평지    경사 20도    턱 0.2 m    벽       도랑 0.5 m
+평지    경사 20도    턱 0.06 m   벽       도랑 0.5 m
 돌      거침         외나무다리   터널     절벽
 ```
 
@@ -67,20 +67,167 @@ python tools/render_maze.py 11 6 16 0.4
 
 ---
 
-## 돌리기
+## 환경 설정
+
+**학습은 콜랩, 테스트와 영상은 로컬**로 나눈다. 로컬은 CPU라 8192 환경 학습을
+못 돌리고, 콜랩은 렌더가 느리고 세션이 끊긴다.
+
+### 로컬 (테스트 · 영상)
+
+```bash
+conda create -n mujoco_env python=3.11
+conda activate mujoco_env
+pip install mujoco==3.8.0 mujoco-mjx==3.8.0 playground==0.1.0
+pip install brax flax optax jax jaxlib
+pip install imageio imageio-ffmpeg mediapy matplotlib pillow numpy
+```
+
+**주의 —** `mujoco` 를 3.9 이상으로 올리면 `playground 0.1.0` 이 깨진다.
+`nconmax` 가 `naconmax` 로 바뀌었다. 올리려면 playground 도 0.2.0 으로 같이
+올린다.
+
+실측 조합 (2026-08-30 기준)
+
+```
+python 3.11   mujoco 3.8.0   mjx 3.8.0   playground 0.1.0
+jax 0.6.2     brax 0.14.1    flax 0.10.7
+```
+
+**주의 —** 사내 pip 미러가 낡은 판을 최신이라 답하는 경우가 있다. 로컬 색인으로
+"최신"을 판정하지 말 것.
+
+### 콜랩 (학습)
 
 ```python
-from go1_nav import loop
-loop.run("<phase14 체크포인트 경로>", nsteps=1000, record=True)
+import os; os.environ["MUJOCO_GL"] = "egl"
 ```
 
-통과 기준 세 줄이다.
+```python
+from google.colab import drive; drive.mount('/content/drive')
+!pip -q install mujoco==3.10.0 brax==0.14.2 playground==0.2.0 mediapy
+import sys; sys.path.insert(0, '/content/drive/MyDrive/2026_han_go1')
+```
+
+`import go1_nav` 이 헤드리스 렌더와 jax 호환 문제를 알아서 잡는다. **`import
+mujoco` 보다 먼저** 부를 것.
+
+### 컴파일 캐시 (선택)
+
+XLA 컴파일이 로컬 테스트 비용의 대부분이다. 영속 캐시를 켜면 프로세스를 새로
+띄워도 다시 굽지 않는다.
 
 ```
-안 넘어진다        요약의 넘어진_스텝이 -1
-앞으로 간다        이동거리가 는다
-영상에서 걷는다    record=True
+기본        자동으로 켜진다 (%LOCALAPPDATA%\go1_nav\jax, 리눅스는 ~/.cache)
+자리 옮기기  GO1_JAX_CACHE=<경로>
+끄기        GO1_JAX_CACHE=""
 ```
+
+미로 하나당 한 벌이 필요하다 -- 지형 배열이 컴파일 결과에 상수로 박힌다
+(64x64 기준 27 MB). 콜랩 캐시와 로컬 캐시는 서로 못 읽는다. 백엔드와 jaxlib
+버전이 열쇠에 들어간다.
+
+---
+
+## 체크포인트 (가중치)
+
+구글 드라이브의 `go1_walking` 폴더에 있다. **저장소에는 안 들어간다** --
+`.gitignore` 가 `*.pkl` 을 막는다.
+
+```
+go1_walking/
+  phase18_speed_fwd/<실행>/final_checkpoint    LLC. 지금 쓰는 보행 정책
+  hlc6/02_목표고침/params_latest.pkl           HLC. 8x16 미로
+  hlc7/params_latest.pkl                       HLC. 64x64 미로 + 역방향
+```
+
+### 가져오기
+
+**콜랩** -- 마운트하면 끝이다.
+
+```python
+from go1_nav import paths
+paths.mount()
+```
+
+**로컬** -- 구글 드라이브 데스크톱을 켜 두면 `paths` 가 알아서 찾는다.
+드라이브 문자와 흔한 자리를 훑어 `go1_walking` 폴더를 집는다.
+
+```python
+from go1_nav import paths
+paths.walking()      # 찾은 자리를 낸다
+```
+
+못 찾으면 뿌리를 직접 준다. **`go1_walking` 자체가 아니라 그 부모**다.
+
+```bash
+set GO1_DRIVE=G:\.shortcut-targets-by-id\<id>      # 윈도우
+export GO1_DRIVE=~/Google\ Drive                    # 리눅스 · 맥
+```
+
+폴더 접근 권한이 없으면 관리자에게 공유를 요청한다. 경로만으로는 안 열린다.
+
+---
+
+## 사용법
+
+### 미로를 눈으로 본다
+
+```bash
+python tools/render_maze.py 11 6 16 0.4
+```
+
+`<씨앗> <세로 랜드> <가로 랜드> <관문 비율>`. `outputs/` 에 그림과 `.npz` 가
+나온다. 파란 띠가 통과 규칙으로 찾은 최단 경로다.
+
+### 정책을 표로 잰다
+
+```bash
+python tools/maze_test.py --체크포인트 hlc7/params_latest.pkl \
+    --씨앗 0 --모양 64 64 --밀도 0.7 --역방향 --판수 2048
+```
+
+차선별 도달률 표가 나온다. 역방향 차선은 이름 앞에 `역·` 가 붙는다.
+
+### 실패 장면을 영상으로 뽑는다
+
+```bash
+python tools/maze_test.py --체크포인트 hlc7/params_latest.pkl \
+    --씨앗 0 --모양 64 64 --밀도 0.7 --역방향 --표없이 \
+    --차선 3 10 25 30 --고를것 시간초과
+```
+
+`--고를것` 은 `fail` · `성공` · `시간초과` · `넘어짐` 이다. **`fail` 은 넘어짐과
+시간초과를 구분하지 않는다** -- 흔한 실패를 보려면 `시간초과` 를 준다.
+
+**차선을 여러 개 한 번에 준다.** 프로세스를 나누면 각자 컴파일을 다시 물어
+느려진다. 실측으로 4편이 한 프로세스 442초, 네 프로세스 391초였다.
+
+### 학습 (콜랩)
+
+```python
+from go1_nav import paths
+from go1_nav.hlc import lands, maze, obs, stage1, train
+
+assert obs.SIGNATURE == '4f5aa2e2400160b7'
+params = train.load(paths.walking() / 'hlc7' / 'params_latest.pkl')
+
+턱빼고 = tuple(k for k in maze.PLACED if k != maze.STEP)
+mz = maze.generate(0, shape=(64, 64), kinds=턱빼고, density=0.7)
+h, c, p = lands.maze_segments(mz, span=6, reverse=True)
+task = stage1.Task({'height': h, 'ceiling': c, 'plan': p})
+
+train.train(task, num_timesteps=100_000_000, num_envs=8192, num_evals=100,
+            restore=params,
+            video_dir=str(paths.walking() / 'hlc7'),
+            stop_at=0.95, stop_patience=3)
+```
+
+**주의 — `video_dir` 을 비우면 체크포인트도 안 쌓인다.** 렌더가 싫으면
+`video_dir` 은 주고 `render` 를 기본값(False)으로 두면 된다. 저장만 하고
+녹화는 안 한다.
+
+`num_evals` 는 저장 주기이자 **중단 가능 지점**이다. jit 한 판이 통째로 GPU 로
+가므로 그 사이에는 인터럽트가 안 걸린다. 40으로 두면 한 판이 한 시간을 넘는다.
 
 ---
 
@@ -137,5 +284,4 @@ docs/contracts    어느 파일도 혼자 소유할 수 없는 것
 ## 채울 것
 
 - 담당자 배정 (nav / HLC / LLC)
-- 체크포인트를 어디에 두고 어떻게 넘길지
-- 터널 높이 · 턱 높이 · 다리 폭의 실측 (지금 값은 근거 없이 고른 것)
+- LLC의 `footswing` 축이 열리면 턱 높이 재측정 (지금 0.06은 그 전의 한계)

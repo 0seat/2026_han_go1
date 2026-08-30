@@ -102,7 +102,28 @@ DEPTH = 1.10                #: 0 아래로 표현 가능한 최대 깊이. 도�
 BASE = 1.0                  #: hfield_size[3]. 격자 아래로 채우는 살덩이 두께
 SPAN = ELEVATION + DEPTH    #: hfield_size[2]
 
-STEP_HEIGHT = 0.2           #: 턱 높이 (m)
+#: 턱 높이 (m). **실측으로 정했다** -- 근거 없이 고른 0.2 를 대체한다.
+#:
+#: 2026-08-19, phase18 체크포인트, 고정 명령 vx=0.6, `hlc/measure.step_limit`.
+#:
+#:     0.04  통과      면각도 45.0도
+#:     0.05  통과      면각도 51.3도
+#:     0.06  통과      면각도 56.3도      <- 여기
+#:     0.07  실패      면각도 60.3도
+#:     0.08  실패      면각도 63.4도
+#:
+#: 실패 유형은 **발이 면에 걸리는 것**이다. 미끄러지지도 전복하지도 않는다.
+#: 면 앞에서 서서 계속 밀다가 13초쯤에 자세가 무너진다. 실측 발 들림이 2.7 cm
+#: (`llc/spec.py`의 `FIXED_GAIT`)이고 그 두 배 언저리가 한계라는 그림이다.
+#:
+#: **이 값은 커리큘럼 구간의 아래끝이지 정답이 아니다.** LLC의 `footswing` 축이
+#: 열리면 (명령 범위 0.06~0.15) 다시 재서 위끝을 올린다. 그때 바뀌는 것은 이
+#: 숫자뿐이고 미로의 그래프 성질은 안 바뀐다 -- 턱은 `blocked`를 세우지 않는
+#: 난이도 요소라, 높이를 낮춰도 단방향 간선은 경사와 낙차가 그대로 만든다.
+#:
+#: 면 각도는 자유 변수가 아니다. 한 셀(0.04 m) 안에서 올라가므로 높이가 정하면
+#: 따라온다. 0.06 이면 56.3도다.
+STEP_HEIGHT = 0.06
 STEP_SPAN = 0.6             #: 턱 상판 길이 (m). 올라섰다 내려온다
 GAP_WIDTH = 0.5             #: gap 폭 (m)
 GAP_DEPTH = 0.5             #: gap 깊이 (m). 구멍이 아니라 도랑이다
@@ -110,19 +131,82 @@ GAP_DEPTH = 0.5             #: gap 깊이 (m). 구멍이 아니라 도랑이다
 WALL_HEIGHT = 0.8           #: 벽 높이 (m). 턱과 모양이 같고 높이만 다르다
 WALL_SPAN = 0.3             #: 벽 두께 (m)
 ROCK_COUNT = 5              #: 돌맹이 랜드에 놓는 돌 개수
-ROCK_RADIUS = 0.22          #: 돌 반지름 (m)
 ROCK_HEIGHT = 0.14          #: 돌 높이 (m). 넘을 수 있게 턱보다 낮게 둔다
+ROCK_FACE_DEG = 45.0        #: 돌의 최대 경사. 여기서 반지름이 정해진다
+#: 돌 반지름 (m). 높이와 최대 경사에서 나온다 -- 셋 중 둘을 정하면 나머지가 따라온다.
+#: 융기 코사인 z = H/2 * (1 + cos(pi d / R)) 의 최대 기울기가 H*pi/(2R)라서,
+#: 그것이 tan(ROCK_FACE_DEG)가 되는 R을 쓴다. 지금 값으로 0.2199 m다.
+ROCK_RADIUS = ROCK_HEIGHT * math.pi / (2.0 * math.tan(math.radians(ROCK_FACE_DEG)))
 
 ROUGH_HEIGHT = 0.06         #: 울퉁불퉁 진폭 (m). 위아래로 이만큼씩
 ROUGH_FEATURE = 0.25        #: 요철 하나의 크기 (m). 발보다 커야 발이 빠지지 않는다
 
-BRIDGE_WIDTH = 0.40         #: 외나무다리 기둥 폭 (m). 실측 stance width 0.202 m
+#: 외나무다리 기둥 폭 (m). **실측으로 고른 값이다.**
+#:
+#: 예전 값 0.40 은 stance width 0.202 m 의 두 배라는 것 말고 근거가 없었다.
+#: 요각 지터를 끄고 대조군 16 판씩 굴려 도달률을 재니 이랬다.
+#:
+#:      폭     고정 (직진만)    조준 (조향한다)
+#:      0.40   0.062            0.062
+#:      0.50   0.188            --
+#:      0.60   0.312            0.375
+#:      0.80   0.438            --
+#:      1.00   0.438            0.688
+#:
+#: 0.40 은 조향을 해도 0.062 다. **폭이 아니라 발 놓는 정밀도의 문제다.** HLC 는
+#: 속도를 명령할 뿐 발 자리를 못 고르므로 학습으로 메울 여지가 얇다. 터널과
+#: 다르다 -- 터널의 대조군 0.000 은 조준 제어기에 height 축이 없어서였고 그 축은
+#: PPO 가 쓸 수 있었다.
+#:
+#: 고정이 1.00 에서도 0.438 에 머무는 것은 폭 때문이 아니라 직진 명령의 요각
+#: 표류다. 조준이 같은 폭에서 0.688 인 것이 그 증거다.
+#:
+#: 그래서 첫 칸은 0.60 이다. 조준 0.375 라 벽이 아니고 위로 여지가 있다. 0.40 은
+#: 나중 칸으로 미룬다. **이 값은 서명 항목이 아니라 바꿔도 restore 는 된다.**
+BRIDGE_WIDTH = 0.60
 BRIDGE_BAR = 0.30           #: I 의 가로대 길이 (m). 진행 방향으로 이만큼
 BRIDGE_DROP = 1.00          #: 양옆이 파인 깊이 (m). 떨어지면 못 돌아온다
 PIT_DEPTH = 1.00            #: 절벽 랜드가 꺼진 깊이 (m)
 
 TUNNEL_WIDTH = 0.80         #: 터널 통로 폭 (m)
-TUNNEL_CLEAR = 0.32         #: 천장 아래 여유 높이 (m). **재봐야 하는 값**
+#: 터널 천장 아랫면 높이 (m).
+#:
+#: 0.32 에서 올렸다. 근거 -- 몸통 높이 명령의 실측 도달 범위가 0.218~0.264 이고
+#: 몸통 두께 절반이 약 0.057 이라, 천장까지 여유가 이랬다.
+#:
+#:     0.32    기본 자세(명령 0.30)  +8 mm     낮춰도(명령 0.22)  +45 mm
+#:     0.36    기본 자세             +48 mm    낮춰도             +85 mm
+#:
+#: 위 두 줄은 기하로 **계산한** 값이라 틀렸다. 모델의 몸통 geom 오프셋이 0.2359 m
+#: 로 나오는데 그대로면 몸통 윗면이 0.53 이고, 그러면 0.36 짜리 터널을 못 지나야
+#: 한다. 실제로는 지난다. 충돌에 안 쓰이는 geom 이 섞여 있다는 뜻이다.
+#:
+#: 그래서 **통과 경계를 직접 스윕했다** (2026-08-21, phase18, vx 0.6, 직진).
+#: 턱 높이를 정할 때와 같은 방법이다.
+#:
+#:     천장    명령 0.30 (기본 자세)   명령 0.25 (정책이 낼 수 있는 최저)
+#:     0.36    통과  x=3.01            통과  x=3.01
+#:     0.34    실패  x=0.87            통과  x=3.01
+#:     0.32    실패  x=0.87            통과  x=3.01
+#:     0.30    실패  x=0.88            실패  x=2.02
+#:     0.28    실패  x=0.87            실패  x=0.87
+#:
+#: 터널은 x=1.0 에서 시작한다. 기본 자세는 **입구 앞 0.87 에서 막힌다.**
+#:
+#: 학습 가능한 창이 **0.32 ~ 0.34** 다. 아래 끝을 고른다 -- "숙여야만 통과"가
+#: 확실하고, 보간한 값이 아니라 실측한 격자점이다. 0.30 에서는 낮춰도 x=2.02 에서
+#: 걸리므로 한 칸 여유가 있다.
+#:
+#: 왜 0.36 을 버리는가 -- 그 값에서는 **기본 자세로 통과된다.** 실제로 2026-08-21
+#: 에 도달 0.953 까지 학습된 정책의 성공판 몸통 최저 z 가 0.250 으로 평지와 같았다.
+#: 정렬해서 들어가는 법을 배웠을 뿐 몸을 낮춘 적이 없다. 이 랜드의 목적은
+#: **`height` 축을 쓰게 만드는 것**이므로 그 값으로는 목적을 못 이룬다.
+#:
+#: `action.SCALE["height"]` 은 안 건드린다. 지금 정책이 낼 수 있는 최저 명령
+#: 0.25(= CENTRE 0.30 - SCALE 0.05)로 통과한다. 실측 몸통 z 는 보행 중
+#: 명령 0.25 에서 0.243, 명령 0.32 에서 0.291 -- **권한 47 mm 에 보행 진동
+#: 8~13 mm** 라 판정이 진동에 묻히지 않는다.
+TUNNEL_CLEAR = 0.32         #: 천장 아래 여유 높이 (m). **실측으로 정했다**
 TUNNEL_THICK = 0.10         #: 천장 두께 (m)
 TUNNEL_WALL = TUNNEL_CLEAR + TUNNEL_THICK   #: 옆벽 높이. 천장 윗면까지 막는다
 
@@ -149,6 +233,21 @@ TUNNEL = 8      #: 터널. 옆벽은 hfield, **천장만 geom**
 PIT = 9         #: 절벽. 랜드 전체가 꺼져 있다. 들어갈 수는 있고 못 나온다
 
 IMPLEMENTED = (FLAT, RAMP, STEP, GAP, ROCK, WALL, ROUGH, BRIDGE, TUNNEL, PIT)
+
+#: 종류 번호 -> 사람이 읽는 이름. 로그와 영상 요약이 쓴다. 숫자만 찍으면 무엇을
+#: 본 것인지 매번 이 파일을 열어 봐야 한다.
+NAMES = {FLAT: "평지", RAMP: "경사", STEP: "턱", GAP: "도랑", ROCK: "돌",
+         WALL: "벽", ROUGH: "거침", BRIDGE: "다리", TUNNEL: "터널",
+         PIT: "절벽"}
+assert set(NAMES) == set(IMPLEMENTED), "이름표에서 빠진 종류가 있습니다"
+
+#: 그림에 쓰는 영문 이름표. **그래프 라벨은 영어로만 쓴다** -- 한글 글꼴이 없는
+#: 환경에서 두부(네모)로 깨지고, 그림은 다른 컴퓨터에서 열린다. 표와 터미널
+#: 출력은 `NAMES` 를 그대로 쓴다.
+NAMES_EN = {FLAT: "flat", RAMP: "ramp", STEP: "step", GAP: "gap", ROCK: "rock",
+            WALL: "wall", ROUGH: "rough", BRIDGE: "bridge", TUNNEL: "tunnel",
+            PIT: "pit"}
+assert set(NAMES_EN) == set(IMPLEMENTED), "영문 이름표에서 빠진 종류가 있습니다"
 
 #: 막힘 격자에서 지나갈 수 없는 종류.
 IMPASSABLE = (GAP, WALL, PIT)
@@ -209,11 +308,41 @@ class Maze:
     start: np.ndarray     #: (2,) float32. 월드 xy
     start_yaw: float      #: 라디안. 정답지가 출발 랜드에서 나가는 방향
     goal: np.ndarray      #: (2,) float32. 월드 xy
+    #: (N, 2) int32. 정답지를 **출발에서 도착 순서대로** 적은 랜드 좌표 (행, 열).
+    #:
+    #: `path` 만으로는 순서를 복원할 수 없다. 길이 자기 옆을 지나가면 어느 칸이
+    #: 꺾임인지 판정이 갈린다 -- 같은 질문("장애물이 꺾임에서 몇 칸인가")에
+    #: 복원 방식을 바꿔가며 30% · 79% 두 답을 얻은 적이 있다. 순서를 생성기가
+    #: 직접 남기면 그 애매함이 사라진다.
+    #:
+    #: 미로 위 임의 지점에서 출발시키는 커리큘럼도 이 배열이 있어야 만든다.
+    route: np.ndarray = None      # type: ignore[assignment]
 
     @property
     def shape(self) -> tuple[int, int]:
         """랜드 개수 (세로, 가로)."""
         return self.kind.shape
+
+    @property
+    def route_xy(self) -> np.ndarray:
+        """(N, 2) float32. `route` 를 랜드 중심의 월드 xy 로."""
+        if self.route is None or len(self.route) == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        return np.stack([tile_center(int(r), int(c), self.kind.shape)
+                         for r, c in self.route])
+
+    @property
+    def turns(self) -> np.ndarray:
+        """(M,) int32. `route` 에서 진행 방향이 바뀌는 칸의 **인덱스**.
+
+        꺾임의 정의를 여기 한 곳에 둔다. 밖에서 격자를 보고 다시 판정하면
+        답이 갈린다.
+        """
+        r = self.route
+        if r is None or len(r) < 3:
+            return np.zeros((0,), dtype=np.int32)
+        d = np.diff(r, axis=0)
+        return (np.nonzero((d[1:] != d[:-1]).any(axis=1))[0] + 1).astype(np.int32)
 
     @property
     def extent(self) -> tuple[float, float]:
@@ -229,8 +358,23 @@ def tile_center(row: int, col: int, shape: tuple[int, int]) -> np.ndarray:
                        (row + 0.5) * TILE - ty * TILE / 2], dtype=np.float32)
 
 
+#: 정답지에 놓는 장애물 종류. `generate(kinds=...)` 로 좁힐 수 있다.
+#:
+#: **턱을 빼고 돌릴 수 있어야 한다.** `STEP_HEIGHT = 0.06` 은 실측한 LLC 한계
+#: 바로 그 값이다 (0.06 통과 · 0.07 실패). 여유가 0 이라 미로의 모든 턱이
+#: 한계선에 걸친 장애물이고, 실패 유형이 "발이 면에 걸려 앞에서 밀다가 무너짐"
+#: 이라 시간 초과로 찍힌다 -- 다른 원인과 구분이 안 된다.
+#:
+#: 넘을 수 없다고 이미 실측된 것을 빼면 남은 실패가 전부 진짜 원인이 된다.
+#: `footswing` 이 열려 `STEP_HEIGHT` 를 올리면 그때 도로 넣는다.
+#:
+#: `IMPLEMENTED` 는 안 건드린다 -- 그쪽을 줄이면 `kind_onehot` 길이가 바뀌어
+#: 관측 서명이 깨진다. 여기는 **생성에만** 쓰는 목록이다.
+PLACED = (ROUGH, ROCK, STEP, BRIDGE, TUNNEL)
+
+
 def generate(seed: int = 0, shape: tuple[int, int] = (4, 10),
-             gate: float = 0.5) -> Maze:
+             gate: float = 0.5, kinds=None, density=None) -> Maze:
     """씨앗에서 미로를 만든다. 같은 씨앗이면 같은 미로다.
 
     `.npz`를 git에 넣지 않는 근거가 이 결정성이다. 재현성은 파일이 아니라
@@ -313,6 +457,9 @@ def generate(seed: int = 0, shape: tuple[int, int] = (4, 10),
         travel.setdefault((r, c), set()).add(ax)
 
     mark(rows[0], 0, 1)
+    # **지나는 순서를 여기서 적는다.** 나중에 `path` 격자를 보고 복원하면
+    # 길이 자기 옆을 스칠 때 순서가 갈린다. 뚫는 쪽이 알고 있으니 적어 둔다.
+    order = [(rows[0], 0)]
     for c in range(1, tx):
         lo, hi = sorted((rows[c - 1], rows[c]))
         if lo != hi:
@@ -322,6 +469,11 @@ def generate(seed: int = 0, shape: tuple[int, int] = (4, 10),
             on_path[lo, c] = True
         mark(rows[c - 1], c - 1, 1)         # 오른쪽으로 나감
         mark(rows[c - 1], c, 1)             # 오른쪽에서 들어옴
+        # 오른쪽으로 한 칸 들어온 뒤, 그 열 안에서 세로로 움직인다.
+        order.append((rows[c - 1], c))
+        step = 1 if rows[c] > rows[c - 1] else -1
+        for r in range(rows[c - 1] + step, rows[c] + step, step):
+            order.append((r, c))
 
     # ---- 2. 언덕 ----
     kind = np.full(shape, FLAT, dtype=np.int8)
@@ -348,15 +500,44 @@ def generate(seed: int = 0, shape: tuple[int, int] = (4, 10),
     rng.shuffle(spots)
     # 자리가 종류 수보다 적을 수 있으므로 **순서도 섞는다.** 고정 순서로 두면
     # 늘 뒤쪽 종류(다리 · 터널)만 빠진다.
-    want = [ROUGH, ROCK, STEP, BRIDGE, TUNNEL]
+    want = [int(k) for k in (PLACED if kinds is None else kinds)]
+    assert want, "놓을 장애물 종류가 하나는 있어야 합니다"
     rng.shuffle(want)
+    # 종류 수보다 자리가 많으면 나머지는 무작위다. 평지를 두 번 넣어 장애물
+    # 밀도를 낮춘다 -- 정답지가 장애물로만 채워지면 조주 거리가 사라진다.
+    fill = [FLAT, FLAT] + want
     for i, (r, c) in enumerate(spots):
-        k = want[i] if i < len(want) else int(
-            rng.choice([FLAT, FLAT, ROUGH, ROCK, STEP, BRIDGE, TUNNEL]))
+        k = want[i] if i < len(want) else int(rng.choice(fill))
         kind[r, c] = k
         t = next(iter(travel[(r, c)]))      # 0 = y 로 지나간다, 1 = x 로
         if k in (BRIDGE, TUNNEL):           # 통로를 따라 걷는다
             axis[r, c] = RUN_Y if t == 0 else RUN_X
+
+    # ---- 3b. 밀도 채우기 ----
+    #
+    # **자리가 모자란 것이 밀도의 진짜 한계다.** 장애물은 한 방향으로만 지나는
+    # 칸에만 놓는데, 정답지는 열마다 행을 바꿔서 대부분이 꺾임 칸이다. 실측 --
+    # 4 x 10 에서 정답지 20칸 중 장애물이 6칸이고 그중 3칸은 언덕이 칠한 경사다.
+    # 그래서 미로당 터널이 0.6 개이고, 하필 경로 끝에 놓이면 `span` 창 12개 중
+    # **한 차선**에만 들어간다. 터널 통과 능력이 0.875 에서 0.000 으로 지워진
+    # 사건의 배경이 이것이다.
+    #
+    # 꺾임 칸에도 놓는다. 다만 **통로 축이 있는 종류는 못 놓는다** -- 다리 상판과
+    # 터널 천장은 곧은 띠라 그 위에서 90도를 돌면 띠 밖으로 나간다. 방향이 없는
+    # 돌 · 거침 · 턱만 쓴다. 경사는 이미 언덕 코드가 꺾임 칸에 칠하고 있고,
+    # 실측으로 정답지 장애물의 31 % 가 그것이었다.
+    if density is not None:
+        free = [int(k) for k in want if k not in (BRIDGE, TUNNEL)]
+        if free:
+            corners = [(r, c) for (r, c), d in travel.items()
+                       if len(d) > 1 and kind[r, c] == FLAT
+                       and (r, c) not in ((rows[0], 0), (rows[-1], tx - 1))]
+            rng.shuffle(corners)
+            walked = list(travel)          # 정답지가 실제로 밟는 칸
+            have = sum(1 for (r, c) in walked if kind[r, c] != FLAT)
+            need = int(round(float(density) * len(walked))) - have
+            for r, c in corners[:max(0, need)]:
+                kind[r, c] = int(rng.choice(free))
 
     # ---- 4. 정답지 밖 ----
     # 터널은 여기 없다. 천장이 geom이라 **개수가 모델에 박히고 배치 전체가 그
@@ -389,7 +570,8 @@ def generate(seed: int = 0, shape: tuple[int, int] = (4, 10),
     # 첫 스텝부터 벽을 보고 있으면 초반 보상이 전부 잡음이 된다.
     first = tile_center(rows[0], 1, shape) - tile_center(rows[0], 0, shape)
     mz = build(seed, kind, level, axis, on_path,
-               start_yaw=float(np.arctan2(first[1], first[0])), gate=float(gate))
+               start_yaw=float(np.arctan2(first[1], first[0])), gate=float(gate),
+               route=np.asarray(order, dtype=np.int32))
     mz.start[:] = tile_center(rows[0], 0, shape)
     mz.goal[:] = tile_center(rows[-1], tx - 1, shape)
     if not reachable(mz)[rows[-1], tx - 1]:
@@ -551,12 +733,15 @@ def _tile_of(xy, shape) -> tuple[int, int]:
 
 def build(seed: int, kind: np.ndarray, level: np.ndarray,
           axis: np.ndarray | None = None, path: np.ndarray | None = None,
-          start_yaw: float = 0.0, gate: float = 0.0) -> Maze:
+          start_yaw: float = 0.0, gate: float = 0.0,
+          route: np.ndarray | None = None) -> Maze:
     """랜드 표 -> 미로. 종류가 늘어도 이 함수의 모양은 안 바뀐다."""
     if axis is None:
         axis = np.full(kind.shape, RUN_Y, dtype=np.int8)
     shape = kind.shape
     return Maze(
+        route=(np.zeros((0, 2), dtype=np.int32) if route is None
+               else np.asarray(route, dtype=np.int32)),
         seed=int(seed), gate=float(gate), kind=kind, level=level, axis=axis,
         height=heightfield(kind, level, axis, seed),
         blocked=blocked(kind),
@@ -610,12 +795,27 @@ def heightfield(kind: np.ndarray, level: np.ndarray,
             else:
                 raise NotImplementedError(f"랜드 종류 {k}는 아직 구현되지 않았습니다.")
 
+    return normalize(metres)
+
+
+def normalize(metres: np.ndarray) -> np.ndarray:
+    """미터 -> mujoco가 요구하는 [0, 1]. 눈금은 `DEPTH`와 `SPAN`이 소유한다.
+
+    시험용 지형(`lands.py`)도 이 함수를 쓴다. 눈금을 두 번 적으면 `env.py`가
+    바닥 geom을 `-DEPTH`로 내려둔 것과 어긋나서, 지형이 통째로 위아래로
+    밀린 채 조용히 돈다.
+    """
     if metres.max() > ELEVATION or metres.min() < -DEPTH:
         raise ValueError(
             f"높이 {metres.min():.3f}~{metres.max():.3f} m가 "
             f"[-{DEPTH}, {ELEVATION}] 밖입니다. 잘려서 조용히 평평해집니다."
         )
     return ((metres + DEPTH) / SPAN).astype(np.float32)
+
+
+def to_metres(height: np.ndarray) -> np.ndarray:
+    """`normalize`의 역. 잰 값을 사람이 읽을 때 쓴다."""
+    return np.asarray(height, dtype=np.float32) * SPAN - DEPTH
 
 
 def _ramp(patch: np.ndarray, level: np.ndarray, ax: int, r: int, c: int) -> None:
@@ -837,7 +1037,13 @@ def _rock(patch: np.ndarray, seed: int, r: int, c: int) -> None:
     돌 높이를 턱보다 낮게 두는 것은 의도다 -- 막는 것이 아니라 발을 걸리게 하는
     것이 목적이고, 막을 것이면 벽을 써야 한다.
 
-    돌을 반구로 만드는 이유 -- 모서리가 있으면 접촉이 튀어 학습이 불안정해진다.
+    **반구를 쓰지 않는다.** 반구는 테두리에서 접선이 수직이다. 높이 0.14 반지름
+    0.22로 격자에 얹으면 마지막 한 셀에서 0.0805 m가 떨어져 63.6도가 나온다 --
+    돌 하나마다 둘레 전체에 8 cm짜리 턱이 생기는 셈이라, "모서리를 없애려고
+    반구로 한다"는 원래 의도와 반대 결과였다.
+
+    대신 융기 코사인을 쓴다. 중심과 테두리 양쪽에서 기울기가 0이라 이어붙는
+    자리에 꺾임이 없고, 최대 경사가 `ROCK_FACE_DEG`로 정확히 정해진다.
     """
     n = patch.shape[0]
     rng = np.random.default_rng((int(seed) * 1_000_003 + r * 1_009 + c) & 0xFFFFFFFF)
@@ -849,10 +1055,10 @@ def _rock(patch: np.ndarray, seed: int, r: int, c: int) -> None:
         cy, cx = rng.uniform(margin, n - margin, size=2)
         d = np.hypot(yy - cy, xx - cx) * CELL          # 중심까지 거리 (m)
         inside = d < ROCK_RADIUS
-        # 반구. 가장자리에서 높이 0이라 이어붙는 자리에 단차가 없다.
+        # 융기 코사인. 테두리에서 높이도 기울기도 0이라 꺾임이 없다.
         one = np.zeros_like(patch)
-        one[inside] = ROCK_HEIGHT * np.sqrt(
-            np.clip(1.0 - (d[inside] / ROCK_RADIUS) ** 2, 0.0, 1.0))
+        one[inside] = ROCK_HEIGHT * 0.5 * (
+            1.0 + np.cos(np.pi * d[inside] / ROCK_RADIUS))
         # 겹치면 더한 게 아니라 **높은 쪽**. 더하면 두 겹친 돌이 두 배로 솟는다.
         bumps = np.maximum(bumps, one)
     patch += bumps
@@ -915,7 +1121,7 @@ def save(maze: Maze, path) -> None:
         seed=maze.seed, gate=maze.gate, kind=maze.kind, level=maze.level,
         axis=maze.axis,
         height=maze.height, blocked=maze.blocked, ceiling=maze.ceiling,
-        path_grid=maze.path, start_yaw=maze.start_yaw,
+        path_grid=maze.path, start_yaw=maze.start_yaw, route=maze.route,
         start=maze.start, goal=maze.goal,
     )
 
@@ -940,5 +1146,6 @@ def load(path) -> Maze:
                 level=z["level"],
                 axis=z["axis"], height=z["height"], blocked=z["blocked"],
                 ceiling=z["ceiling"], path=z["path_grid"],
+                route=z["route"] if "route" in z else None,
                 start_yaw=float(z["start_yaw"]),
                 start=z["start"], goal=z["goal"])
