@@ -287,6 +287,18 @@ def train(task, *, num_timesteps=20_000_000, num_envs=1024, num_evals=10,
     seen = {"n": 0}
     # 저장 자리. 안 주면 옛 호출과 같게 `video_dir` 로 떨어진다.
     out_dir = save_dir if save_dir is not None else video_dir
+    # **둘 다 없으면 시끄럽게 알린다.** 조용히 넘어가면 몇 시간 뒤에야 안다.
+    # 실측 -- `video_dir` 을 주석 처리하고 27.5M 스텝을 저장 없이 돌렸다.
+    # 그 전에는 `video_dir=None` 이 저장까지 끄는 바람에 9시간을 날렸다.
+    # 저장을 끄는 것이 정당한 경우(배선 시험)가 있으므로 막지는 않는다.
+    if out_dir is None:
+        print("\n" + "!" * 66, flush=True)
+        print("  주의 -- 체크포인트를 저장하지 않습니다.", flush=True)
+        print("  save_dir 도 video_dir 도 없습니다. 런타임이 끊기면 전부 잃습니다.",
+              flush=True)
+        print("  저장하려면  train(..., save_dir=str(paths.walking() / 'hlc8'))",
+              flush=True)
+        print("!" * 66 + "\n", flush=True)
 
     def on_params(step, make_policy, params):
         """**평가마다 파라미터를 저장하고**, 가끔 영상을 남긴다.
