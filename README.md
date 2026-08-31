@@ -209,30 +209,61 @@ python tools/maze_test.py --체크포인트 hlc7/params_latest.pkl \
 
 ### 학습 (콜랩)
 
+**코드는 드라이브에서 읽는다.** 깃허브에서 받지 않는다 -- 저장소를
+`MyDrive/2026_han_go1` 에 두고 `sys.path` 에 얹는다. 로컬에서 고친 것이
+동기화되면 그대로 반영되므로 커밋을 기다릴 필요가 없다.
+
+첫 칸 -- 설치와 마운트.
+
 ```python
+import os; os.environ["MUJOCO_GL"] = "egl"
+
+from google.colab import drive; drive.mount('/content/drive')
+!pip -q install mujoco==3.10.0 brax==0.14.2 playground==0.2.0 mediapy
+import sys; sys.path.insert(0, '/content/drive/MyDrive/2026_han_go1')
+import jax
+```
+
+둘째 칸 -- 판을 세우고 학습.
+
+```python
+import os; os.environ['GO1_CEIL'] = '1'
+os.environ['GO1_JAX_CACHE'] = '/content/drive/MyDrive/jax_cache'
 from go1_nav import paths
 from go1_nav.hlc import lands, maze, obs, stage1, train
 
-assert obs.SIGNATURE == '4f5aa2e2400160b7'
+assert obs.SIGNATURE == '4f5aa2e2400160b7' and stage1.MAX_STEPS == 300
 params = train.load(paths.walking() / 'hlc7' / 'params_latest.pkl')
 
 턱빼고 = tuple(k for k in maze.PLACED if k != maze.STEP)
 mz = maze.generate(0, shape=(64, 64), kinds=턱빼고, density=0.7)
 h, c, p = lands.maze_segments(mz, span=6, reverse=True)
 task = stage1.Task({'height': h, 'ceiling': c, 'plan': p})
+print(f'차선 {task.n_lanes}  천장 {len(c)}  hfield {h.shape}')
 
-train.train(task, num_timesteps=100_000_000, num_envs=8192, num_evals=100,
-            restore=params,
-            video_dir=str(paths.walking() / 'hlc7'),
-            stop_at=0.95, stop_patience=3)
+mk, params, metrics, hist = train.train(
+    task, num_timesteps=100_000_000, num_envs=8192,
+    num_evals=100,                                    # 1M 마다 저장, 13분마다 중단 가능
+    restore=params,
+    video_dir=str(paths.walking() / 'hlc7'),          # 저장 켜기. render 는 기본 False
+    stop_at=0.95, stop_patience=3)
 ```
 
-**주의 — `video_dir` 을 비우면 체크포인트도 안 쌓인다.** 렌더가 싫으면
-`video_dir` 은 주고 `render` 를 기본값(False)으로 두면 된다. 저장만 하고
-녹화는 안 한다.
+**판마다 바뀌는 줄은 둘뿐이다** -- `maze.generate` 의 씨앗 · 모양과, 저장 자리.
+
+`save_dir` 이 생겼다 (2026-08-30). 체크포인트는 `save_dir`, 영상은 `video_dir`
+이다. 안 주면 `video_dir` 로 떨어져 위 칸이 그대로 돌지만, **렌더를 끄려고
+`video_dir` 을 비우면 저장까지 꺼지던 함정**이 `save_dir` 을 쓰면 사라진다.
 
 `num_evals` 는 저장 주기이자 **중단 가능 지점**이다. jit 한 판이 통째로 GPU 로
 가므로 그 사이에는 인터럽트가 안 걸린다. 40으로 두면 한 판이 한 시간을 넘는다.
+
+**주의 -- 드라이브 동기화가 끝났는지 확인할 것.** 옛 코드가 올라가 있으면
+`WEAVE` 가 없어 `AttributeError` 로 걸린다.
+
+```python
+assert (maze.SLOPE_DEG, maze.WEAVE) == (10.0, 5)
+```
 
 ---
 
