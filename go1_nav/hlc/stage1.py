@@ -800,7 +800,8 @@ def rollout(task, policy, rng, nsteps=MAX_STEPS, record=False):
 
 
 def debug_video(task, policy, filename, rng=None, nsteps=MAX_STEPS,
-                tries=6, prefer="fail", stride=2, lane=None):
+                tries=6, prefer="fail", stride=1, lane=None,
+                height=480, width=640, camera="track", route=None):
     """**실패한 판을 골라** 영상으로 남긴다.
 
     seed 를 고정해 한 판만 찍으면 대표성이 없다 -- 턱 대조군이 도달률 0.812 인데
@@ -824,6 +825,12 @@ def debug_video(task, policy, filename, rng=None, nsteps=MAX_STEPS,
     "fail" 이 넘어짐과 시간초과를 **구분하지 않는 것이 함정이다.** 실측 -- 어느
     차선이 시간초과 0.875 · 넘어짐 0.125 인데 "fail" 이 골라 준 것이 넘어진
     판이었다. 12.5 % 를 보고 87.5 % 를 설명할 뻔했다. 둘은 처방이 정반대다.
+
+    **못 찾으면 가장 멀리 간 판을 쓴다.** 전에는 마지막 seed 를 그냥 썼는데,
+    그러면 하필 최악이 뽑힌다. 실측 -- 200 m 구간에서 "성공" 을 못 찾자 마지막
+    seed 를 골랐고, 그 판은 336 스텝에서 끼여 2,865 스텝을 제자리에 서 있었다.
+    같은 판의 다른 seed 는 목표까지 9.1 m 까지 갔다. 5 분짜리 영상의 대부분이
+    정지 화면이었다.
 
     `lane`
         찍고 싶은 차선. **Task 를 그대로 두고 seed 로 고른다** (`seeds_for_lane`).
@@ -856,19 +863,30 @@ def debug_video(task, policy, filename, rng=None, nsteps=MAX_STEPS,
         return None
 
     if matches({"도달": False, "넘어짐": False}) is not None:
+        best = None
         for k in keys:
             summary, _ = rollout(task, policy, k, nsteps, record=False)
             if matches(summary):
                 pick, found = k, True
                 break
+            # 못 찾을 때를 대비해 **가장 멀리 간 판**을 들고 있는다.
+            score = -float(summary["목표까지_m"])
+            if best is None or score > best[0]:
+                best = (score, k)
+        if not found and best is not None:
+            pick = best[1]
 
     summary, frames = rollout(task, policy, pick, nsteps, record=True)
     # 찾던 판을 실제로 찾았는가. 못 찾았으면 마지막 seed 를 그냥 찍은 것이다.
     summary["찾음"] = bool(found)
     summary["고른것"] = prefer if bool(found) else "(못 찾음)"
-    # stride 2 -> 5 Hz. 렌더가 프레임당 1.3 초라 여기가 비용의 전부다.
-    # 무엇이 잘못됐는지 보는 데는 5 Hz 로 충분하다.
-    save_video(task.env, frames, filename, fps=10, stride=stride)
+    # **HLC 가 10 Hz 라 여기가 프레임의 상한이다.** 한 스텝이 LLC 5 스텝인데
+    # `Task.step` 의 scan 이 중간 상태를 안 돌려주므로, 기록되는 자세는 HLC
+    # 스텝마다 하나다. stride 1 이면 10 fps 이고 그보다 올릴 방법이 없다.
+    # 더 부드럽게 하려면 LLC 서브스텝을 기록해야 하고, 그건 학습 경로의 메모리를
+    # 5 배로 만들므로 녹화 전용 경로를 따로 내야 한다.
+    save_video(task.env, frames, filename, fps=10, stride=stride,
+               height=height, width=width, camera=camera, route=route)
     return summary
 
 def reward_sanity(dist0=4.0, reach_steps=85, stall_steps=200, fall_step=20,

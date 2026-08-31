@@ -42,6 +42,13 @@ def main() -> None:
     ap.add_argument("--스텝", type=int, default=None)
     ap.add_argument("--차선", type=int, nargs="*", default=None,
                     help="영상을 찍을 차선 번호. 안 주면 안 찍는다")
+    ap.add_argument("--시도", type=int, default=12,
+                    help="원하는 결과를 찾느라 굴려 보는 횟수. 완주 영상처럼 "
+                         "한 판이 비싸면 줄인다")
+    ap.add_argument("--경로표시", action="store_true",
+                    help="정답 경로 칸을 반투명 파란 판으로 깐다")
+    ap.add_argument("--시점", default="track",
+                    help="track (따라가기) 또는 탑뷰")
     ap.add_argument("--고를것", default="fail",
                     help="fail · 성공 · 시간초과 · 넘어짐")
     ap.add_argument("--표없이", action="store_true", help="측정을 건너뛴다")
@@ -117,8 +124,10 @@ def main() -> None:
             print(stage1.debug_video(task, policy,
                                      out / f"lane{lane}_{args.고를것}.mp4",
                                      nsteps=args.스텝 or stage1.MAX_STEPS,
-                                     tries=12, stride=2, prefer=args.고를것,
-                                     lane=lane))
+                                     tries=args.시도, stride=1, prefer=args.고를것,
+                                     lane=lane, camera=args.시점,
+                                     route=(p["lane_route"][lane]
+                                            if args.경로표시 else None)))
 
 
 if __name__ == "__main__":

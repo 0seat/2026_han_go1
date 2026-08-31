@@ -231,11 +231,11 @@ def _progress(items):
 #:     안 닿는다. ambient 가 0 이라 그늘이 새까맣다
 #:     지형 재질이 `groundplane` 인데 반사율 0.8 이라 어둡고 번들거린다
 BRIGHT = {
-    "headlight_ambient": 0.60,   # 전에 쓰던 값. 이것만으로는 부족했다
-    "headlight_diffuse": 0.85,
+    "headlight_ambient": 0.45,   # 격자를 넣은 뒤 낮췄다. 0.60 이면 바닥이 날아간다
+    "headlight_diffuse": 0.75,
     "headlight_specular": 0.05,
     "light_diffuse": 0.70,
-    "light_ambient": 0.45,       # 원래 0.0 이라 그늘이 새까맸다
+    "light_ambient": 0.35,       # 원래 0.0 이라 그늘이 새까맸다
     "light_specular": 0.05,
     "ground_reflect": 0.0,       # 원래 0.8. 어둡고 번들거렸다
     # **`mat_rgba` 는 무늬가 있으면 안 먹는다** (실측: 값을 바꿔도 픽셀이 동일).
@@ -245,9 +245,21 @@ BRIGHT = {
     # 백지가 되어 굴곡을 읽을 단서가 사라진다. **무늬는 남기고 밝게 다시 그린다.**
     # 밝은 두 톤을 푸르게. 회색 무늬에 회색 로봇이면 서로 안 읽힌다.
     # 대비가 크면 굴곡보다 무늬가 먼저 읽히므로 두 톤을 가깝게 둔다.
-    "checker": ((198, 208, 220), (170, 181, 196)),
-    "checker_tiles": 8,
-    "texrepeat": 6.0,
+    # 바닥을 **흰 바탕에 1 m 격자**로 다시 그린다. 체커는 굴곡을 읽히게 해 주지만
+    # 눈금이 없어서 "얼마나 갔나 · 얼마나 벌어졌나" 를 못 읽는다. 격자는 그 둘을
+    # 같이 준다 -- 밝아서 지형이 보이고, 칸이 1 m 라 거리가 바로 읽힌다.
+    #
+    # 1 m 를 맞추는 법 -- 텍스처 한 번 반복이 1 m 가 되도록 `mat_texrepeat` 를
+    # hfield 의 실제 크기에서 계산한다 (`brighten` 참고). 상수로 박으면 지형
+    # 크기가 바뀔 때마다 눈금이 거짓말을 한다.
+    "grid_base": (236, 239, 244),      # 바탕. 완전한 흰색은 형태가 날아간다
+    "grid_line": (112, 126, 148),      # 격자선. 로봇(회색)과 구별되게 푸르게
+    # 50 cm. 1 m 로 뒀더니 칸이 커서 굴곡이 안 읽혔다 -- 격자선 사이가 비어 있으면
+    # 그 안의 높낮이를 눈이 못 잡는다. 반으로 줄이면 선이 지형을 따라 휘는 것이
+    # 보인다.
+    "grid_metres": 0.5,                # 격자 한 칸 (m)
+    "grid_px": 64,                     # 텍스처 한 칸의 픽셀
+    "grid_line_px": 2,                 # 선 두께. 64 px 에 2 px = 3 cm
 }
 
 
@@ -272,34 +284,150 @@ def brighten(model):
             continue
         m.geom_rgba[g] = BRIGHT["ground_rgba"]
         mat = int(m.geom_matid[g])
-        if mat >= 0:
-            m.mat_reflectance[mat] = BRIGHT["ground_reflect"]
-            m.mat_rgba[mat] = BRIGHT["ground_rgba"]
-            m.mat_texrepeat[mat] = BRIGHT["texrepeat"]
-            for tex in set(int(t) for t in m.mat_texid[mat]):
-                if tex >= 0:
-                    _repaint_checker(m, tex)
+        if mat < 0:
+            continue
+        m.mat_reflectance[mat] = BRIGHT["ground_reflect"]
+        m.mat_rgba[mat] = BRIGHT["ground_rgba"]
+        # **`texrepeat` 은 지형 전체의 반복 수가 아니라 미터당 반복 수다.**
+        # 이 재질은 `texuniform = 1` 이라 월드 단위로 매핑된다. 지형 폭(448 m)을
+        # 넣었더니 미터당 448 번이 되어 화면이 모아레로 덮였다. 한 칸을 1 m 로
+        # 두려면 미터당 1 번이다.
+        rep = 1.0 / float(BRIGHT["grid_metres"])
+        m.mat_texuniform[mat] = 1
+        m.mat_texrepeat[mat] = (rep, rep)
+        for tex in set(int(t) for t in m.mat_texid[mat]):
+            if tex >= 0:
+                _repaint_grid(m, tex)
     return m
 
 
-def _repaint_checker(m, tex):
-    """텍스처 하나를 밝은 회색 체커로 다시 그린다. **픽셀만 바꾼다.**"""
+def _repaint_grid(m, tex):
+    """텍스처 하나를 **흰 바탕 + 격자선**으로 다시 그린다. 픽셀만 바꾼다.
+
+    한 번 반복이 격자 한 칸이므로, 여기서는 **가장자리 두 변에만** 선을 긋는다.
+    반복이 이어붙으면 그 선들이 격자가 된다. 안쪽에 선을 더 그으면 `texrepeat`
+    가 뜻하는 칸 수와 눈에 보이는 칸 수가 어긋난다.
+    """
     import numpy as _np
 
     w, h = int(m.tex_width[tex]), int(m.tex_height[tex])
     nch = int(m.tex_nchannel[tex]) if hasattr(m, "tex_nchannel") else 3
     adr = int(m.tex_adr[tex])
-    hi, lo = (_np.asarray(c, _np.uint8) for c in BRIGHT["checker"])
-    k = max(1, h // BRIGHT["checker_tiles"])
-    rows = (_np.arange(h) // k)[:, None]
-    cols = (_np.arange(w) // k)[None, :]
-    even = ((rows + cols) % 2 == 0)[:, :, None]
-    img = _np.where(even, hi[:nch], lo[:nch]).astype(_np.uint8)
+    base = _np.asarray(BRIGHT["grid_base"], _np.uint8)[:nch]
+    line = _np.asarray(BRIGHT["grid_line"], _np.uint8)[:nch]
+    # 선 두께를 텍스처 크기에 맞춰 준다. 64 px 기준으로 적어 둔 값을 비례로 옮긴다.
+    t = max(1, int(round(BRIGHT["grid_line_px"] * min(w, h)
+                         / max(1, BRIGHT["grid_px"]))))
+    img = _np.broadcast_to(base, (h, w, nch)).copy()
+    img[:t, :] = line
+    img[:, :t] = line
     m.tex_data[adr:adr + w * h * nch] = img.reshape(-1)
 
 
-def render_frames(env, states, camera="track", height=180, width=240,
-                  bright=True):
+#: 탑뷰 카메라. **모델에 없는 시점이라 그때그때 만든다.**
+#:
+#: `track` 은 뒤에서 따라가는 시점이라 "지금 무슨 지형을 밟는가" 는 잘 보이는데
+#: "경로 어디쯤인가 · 어디로 꺾는가" 가 안 보인다. 위에서 보면 그 둘이 보인다.
+#: 발표용으로는 둘을 같이 내는 편이 낫다.
+#: 실측으로 고른 값 -- 수직(-89도)이면 벽과 언덕이 평면으로 뭉개져 높낮이가
+#: 안 읽히고, -45도면 하늘이 화면의 3분의 1을 먹는다 (8x16 은 세로 16 m 라
+#: 6 m 위에서도 지도 밖이 보인다).
+TOPDOWN = {"거리": 7.0, "고도": -72.0, "방위": 90.0, "높이보정": 0.3}
+
+#: 경로 표시. **로봇이 받는 길잡이가 어디를 가리키는지** 보이게 한다.
+#:
+#: hfield 는 칸마다 색을 못 준다 -- 재질이 하나이고 텍스처가 월드 좌표로 반복된다.
+#: 그래서 지형을 칠하는 대신 **렌더 장면에 도형을 얹는다.** 물리는 이미 끝난
+#: 뒤이고 도형은 `mjvScene` 에만 들어가므로 시뮬레이션에 영향이 없다.
+#:
+#: **칸마다 판을 까는 방식은 버렸다.** 타일 중심에 1.7 m 판을 놓으면 판끼리
+#: 떨어져 보이고, 지형이 판 안에서 기울면 한쪽이 땅에 박히고 반대쪽이 뜬다.
+#: 대신 경로를 잘게 다시 뽑아 **이어진 선**으로 긋는다. 촘촘하면 선이 지형을
+#: 따라 휘므로 박히지도 뜨지도 않는다.
+ROUTE_LINE = {"간격": 0.25, "굵기": 0.055, "띄움": 0.035,
+              "색": (0.30, 0.58, 0.95, 0.85)}
+
+
+def _ground_z(model, hf, x, y):
+    """hfield 위 그 자리의 지면 높이 (m). 선을 지형에 붙여 놓으려면 필요하다."""
+    import numpy as _np
+
+    rx, ry, elev = (float(model.hfield_size[hf][i]) for i in range(3))
+    nrow, ncol = int(model.hfield_nrow[hf]), int(model.hfield_ncol[hf])
+    adr = int(model.hfield_adr[hf])
+    data = model.hfield_data[adr:adr + nrow * ncol].reshape(nrow, ncol)
+    # hfield 는 geom 중심을 기준으로 (-rx, rx) x (-ry, ry) 를 덮는다.
+    j = int(_np.clip((x + rx) / (2 * rx) * (ncol - 1), 0, ncol - 1))
+    i = int(_np.clip((y + ry) / (2 * ry) * (nrow - 1), 0, nrow - 1))
+    return float(data[i, j]) * elev
+
+
+def _resample_line(route, step):
+    """경로를 `step` 간격으로 다시 뽑는다. 꺾임에서도 간격이 유지된다."""
+    import numpy as _np
+
+    pts = _np.asarray(route, _np.float64).reshape(-1, 2)
+    if len(pts) < 2:
+        return pts
+    seg = _np.linalg.norm(_np.diff(pts, axis=0), axis=1)
+    along = _np.concatenate([[0.0], _np.cumsum(seg)])
+    if along[-1] <= 0:
+        return pts[:1]
+    want = _np.arange(0.0, along[-1], float(step))
+    return _np.stack([_np.interp(want, along, pts[:, 0]),
+                      _np.interp(want, along, pts[:, 1])], axis=1)
+
+
+def _draw_route(model, scene, route):
+    """정답 경로를 **이어진 선**으로 긋는다. 장면에만 넣는다."""
+    import mujoco
+    import numpy as _np
+
+    hg = next((g for g in range(model.ngeom)
+               if int(model.geom_type[g]) == int(mujoco.mjtGeom.mjGEOM_HFIELD)),
+              None)
+    if hg is None:
+        return
+    hf, gz = int(model.geom_dataid[hg]), float(model.geom_pos[hg][2])
+    pts = _resample_line(route, ROUTE_LINE["간격"])
+    if len(pts) < 2:
+        return
+    z = _np.array([gz + _ground_z(model, hf, x, y) + ROUTE_LINE["띄움"]
+                   for x, y in pts])
+    rgba = _np.array(ROUTE_LINE["색"], _np.float32)
+    for i in range(len(pts) - 1):
+        if scene.ngeom >= scene.maxgeom:
+            break
+        g = scene.geoms[scene.ngeom]
+        mujoco.mjv_initGeom(g, mujoco.mjtGeom.mjGEOM_CAPSULE,
+                            _np.zeros(3), _np.zeros(3), _np.eye(3).reshape(9),
+                            rgba)
+        mujoco.mjv_connector(
+            g, int(mujoco.mjtGeom.mjGEOM_CAPSULE), ROUTE_LINE["굵기"],
+            _np.array([pts[i][0], pts[i][1], z[i]]),
+            _np.array([pts[i + 1][0], pts[i + 1][1], z[i + 1]]))
+        scene.ngeom += 1
+
+
+def _camera(model, kind, data=None):
+    """`kind` -> `update_scene` 에 넣을 카메라. 문자열이면 모델의 카메라를 쓴다."""
+    import mujoco
+
+    if kind != "탑뷰":
+        return kind if kind is not None else -1
+    cam = mujoco.MjvCamera()
+    cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+    cam.distance = float(TOPDOWN["거리"])
+    cam.elevation = float(TOPDOWN["고도"])
+    cam.azimuth = float(TOPDOWN["방위"])
+    if data is not None:
+        cam.lookat[:] = (float(data.qpos[0]), float(data.qpos[1]),
+                         float(data.qpos[2]) + TOPDOWN["높이보정"])
+    return cam
+
+
+def render_frames(env, states, camera="track", height=480, width=640,
+                  bright=True, route=None):
     """상태 목록 -> 이미지 목록. **playground 의 `render_array` 를 대체한다.**
 
     왜 직접 쓰는가
@@ -330,9 +458,15 @@ def render_frames(env, states, camera="track", height=180, width=240,
     import mujoco
 
     m = brighten(env.mj_model) if bright else env.mj_model
-    renderer = mujoco.Renderer(m, height=height, width=width)
+    # 선은 잘게 나누므로 점 수보다 훨씬 많다. 경로 길이 / 간격 만큼 잡는다.
+    n_extra = 0
+    if route is not None:
+        pts = np.asarray(route).reshape(-1, 2)
+        length = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
+        n_extra = int(length / ROUTE_LINE["간격"]) + 8
+    renderer = mujoco.Renderer(m, height=height, width=width,
+                               max_geom=10000 + n_extra)
     d = mujoco.MjData(m)
-    cam = camera if camera is not None else -1
     out = []
     try:
         for state in _progress(states):
@@ -341,15 +475,18 @@ def render_frames(env, states, camera="track", height=180, width=240,
             mujoco.mj_kinematics(m, d)
             mujoco.mj_comPos(m, d)      # track 카메라가 subtree_com 을 본다
             mujoco.mj_camlight(m, d)
-            renderer.update_scene(d, camera=cam)
+            # **탑뷰는 프레임마다 다시 만든다.** 로봇을 따라가야 하기 때문이다.
+            renderer.update_scene(d, camera=_camera(m, camera, d))
+            if route is not None:
+                _draw_route(m, renderer.scene, route)
             out.append(renderer.render())
     finally:
         renderer.close()
     return out
 
 
-def save_video(env, states, filename, fps=50, stride=2, camera="track",
-               height=180, width=240, bright=True):
+def save_video(env, states, filename, fps=50, stride=1, camera="track",
+               height=480, width=640, bright=True, route=None):
     """영상 저장. 세 단계로 물러난다.
 
         1  mediapy         PATH 의 ffmpeg 을 쓴다. 콜랩은 여기서 끝난다
@@ -374,7 +511,8 @@ def save_video(env, states, filename, fps=50, stride=2, camera="track",
     # 모델의 헤드라이트를 직접 고쳤는데, 그 값(ambient 0.6 / diffuse 0.8)으로도
     # 어두웠다. **원인은 헤드라이트가 아니라 지형 재질과 조명 ambient 였다.**
     rendered = render_frames(env, states[::stride], camera=camera,
-                             height=height, width=width, bright=bright)
+                             height=height, width=width, bright=bright,
+                             route=route)
     out_fps = max(fps // stride, 1)
 
     try:
