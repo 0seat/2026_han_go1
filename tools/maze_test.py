@@ -78,7 +78,7 @@ def main() -> None:
                        density=args.밀도)
     h, c, p = lands.maze_segments(mz, span=args.구간,
                                   reverse=args.역방향)
-    params = train.load(paths.walking() / args.체크포인트)
+    params = train.load(paths.params_file(args.체크포인트))
     out = (paths.outputs(f"미로{args.씨앗}") if args.출력 is None
            else Path(args.출력))
     out.mkdir(parents=True, exist_ok=True)

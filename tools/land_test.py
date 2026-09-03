@@ -24,7 +24,7 @@ def main() -> None:
     from go1_nav.hlc import maze, measure, stage1, train
 
     by_name = {v: k for k, v in maze.NAMES.items()}
-    params = train.load(paths.walking() / args.체크포인트)
+    params = train.load(paths.params_file(args.체크포인트))
     for name in args.랜드:
         kind = by_name[name]
         lv = args.단 if kind == maze.RAMP else 0

@@ -31,7 +31,7 @@ def main() -> None:
     from go1_nav import paths
     from go1_nav.hlc import measure
 
-    ckpt = None if args.체크포인트 is None else paths.walking() / args.체크포인트
+    ckpt = None if args.체크포인트 is None else paths.params_file(args.체크포인트)
     grid = {"vx": args.vx, "pitch": args.pitch, "height": args.height}
     if args.stance:
         grid["stance_width"] = args.stance

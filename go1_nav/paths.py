@@ -137,6 +137,49 @@ def llc() -> Path:
     return checkpoint(LLC_PHASE, LLC_RUN)
 
 
+def params_file(spec) -> Path:
+    """체크포인트 pkl 을 찾는다. **드라이브가 없어도 되게 한다.**
+
+    전에는 `walking() / spec` 하나였다. 그러면 구글 드라이브 공유 폴더가 붙어
+    있는 사람만 쓸 수 있다 -- pkl 파일 하나 받아서 돌려 보려는 사람이 첫
+    명령에서 막힌다. 순서대로 본다.
+
+        1  그대로 있으면 그것          절대경로도 상대경로도 된다
+        2  GO1_PARAMS/<spec>          pkl 만 모아 둔 폴더가 따로 있을 때
+        3  walking()/<spec>           지금까지의 방식
+
+    2번이 있는 이유 -- 팀원에게 pkl 을 몇 개 건네줄 때 폴더 구조를 드라이브와
+    똑같이 맞추라고 하는 것보다 환경변수 하나로 가리키게 하는 편이 낫다.
+    """
+    spec = Path(spec)
+    if spec.exists():
+        return spec
+
+    tried = [str(spec)]
+    base = os.environ.get("GO1_PARAMS")
+    if base:
+        cand = Path(base) / spec
+        if cand.exists():
+            return cand
+        tried.append(str(cand))
+
+    try:
+        cand = walking() / spec
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"{spec} 를 못 찾았습니다."
+            f"\n  본 자리   " + "  ".join(tried) +
+            f"\n  그리고 드라이브도 못 찾았습니다 -- {exc}"
+            f"\n  pkl 을 직접 가리키거나(절대경로), GO1_PARAMS 에 그 부모 "
+            f"폴더를 지정하세요."
+        ) from None
+    if cand.exists():
+        return cand
+    tried.append(str(cand))
+    raise FileNotFoundError(
+        f"{spec} 를 못 찾았습니다. 본 자리:\n  " + "\n  ".join(tried))
+
+
 def outputs(sub: str = "") -> Path:
     """산출물 폴더. 저장소 옆(`outputs/`)에 만든다. git에 안 올라간다."""
     root = Path(__file__).resolve().parent.parent / "outputs"
