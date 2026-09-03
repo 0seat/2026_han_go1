@@ -298,7 +298,8 @@ class Task(mjx_env.MjxEnv):
     def __init__(self, kind, *, checkpoint=None, level_after=0, axis=None,
                  llc_gain=LLC_GAIN, llc_bias=LLC_BIAS, seed=0,
                  yaw_jitter=YAW_JITTER, speed_jitter=SPEED_JITTER,
-                 start_shift=0.0, route_jitter=ROUTE_JITTER, **corridor):
+                 start_shift=0.0, route_jitter=ROUTE_JITTER, texture=None,
+                 **corridor):
         # `kind` 가 여럿이면 차선 복도다. 판이 배치 안에서 섞이므로 **망각이
         # 일어나지 않는다.** 하나면 예전과 완전히 같은 복도가 나온다.
         if isinstance(kind, dict):          # 이미 만들어진 복도를 그대로 받는다
@@ -314,7 +315,10 @@ class Task(mjx_env.MjxEnv):
                 kind, level_after=level_after, axis=axis, seed=seed,
                 **corridor)
         self.env = hlc_env.make(terrain=self.height_np,
-                                ceiling=ceiling if len(ceiling) else None)
+                                ceiling=ceiling if len(ceiling) else None,
+                                texture=texture)
+        #: 바닥에 `paint_map` 그림을 깔았는가. 렌더가 덮어쓰지 않게 표시한다.
+        self.painted = texture is not None
         # 관측용으로도 들고 있는다. **렌더링용 geom 과 같은 배열이어야 한다** --
         # 두 곳에서 따로 만들면 로봇이 보는 천장과 부딪히는 천장이 어긋난다.
         self.ceiling = jnp.asarray(ceiling, jnp.float32).reshape(-1, 6)
@@ -326,8 +330,34 @@ class Task(mjx_env.MjxEnv):
         if checkpoint is None:
             from .. import paths
             checkpoint = paths.llc()
-        self.llc_policy = loader.load_policy(
-            checkpoint, loader.env_observation_size(self.env))
+        obs_size = loader.env_observation_size(self.env)
+        self.llc_policy = loader.load_policy(checkpoint, obs_size)
+
+        # **스킬 정책. 파라미터만 다르고 신경망은 같다.**
+        #
+        # `(인덱스, 정책)` 목록이다. 인덱스는 `skills.REGISTRY` 순서이고
+        # `SkillState.active` 가 그 값을 낸다. 꺼진 스킬은 안 싣는다 -- 파일을
+        # 읽는 비용도 없고, 아래 선택 코드가 통째로 사라진다.
+        #
+        # 관측 크기를 여기서도 검증한다. `load_policy` 는 크기가 달라도 조용히
+        # 통과한 뒤 행동만 이상해진다 (`loader.load_policy` 주석). 최신 기립
+        # 계보가 state 42 · privileged 91 이라 이 검사가 실제로 걸린다.
+        from .. import paths as _paths
+        self.skill_policies = []
+        for i, sk in enumerate(skills.REGISTRY):
+            if not sk.enabled:
+                continue
+            root = _paths.checkpoint(sk.phase, sk.run)
+            got = loader.inspect(root, verbose=False)["observation_size"]
+            want = {k: (int(v),) if not isinstance(v, tuple) else tuple(v)
+                    for k, v in obs_size.items()}
+            assert tuple(got["state"]) == want["state"], (
+                f"{sk.name} 의 state 가 {got['state']} 인데 환경은 {want['state']} "
+                f"입니다. 파라미터 교체로는 못 씁니다")
+            assert tuple(got["privileged_state"]) == want["privileged_state"], (
+                f"{sk.name} 의 privileged 가 {got['privileged_state']} 인데 "
+                f"환경은 {want['privileged_state']} 입니다")
+            self.skill_policies.append((i, loader.load_policy(root, obs_size)))
 
         self.height = jnp.asarray(self.height_np)
         self.shape = self.plan["shape"]
@@ -634,12 +664,14 @@ class Task(mjx_env.MjxEnv):
         # 기본 자세가 바뀌고 미학습 축이 UNTRAINED_HOLD 를 벗어난다.
         sent = action.perturb(command, gain_bias[0], gain_bias[1])
 
-        # 특수 동작 자리. 지금은 전부 꺼져 있어 항상 걷기가 나온다. 켜지면 여기서
-        # `skill.active` 에 따라 정책을 갈아 끼운다 -- 걷기 · 점프 · 기립 세
-        # 체크포인트의 관측 · 행동 인터페이스가 같아 파라미터만 바꾸면 된다.
+        # 특수 동작. `skill.active` 가 -1 이면 걷기, 0 이상이면 그 스킬이 LLC 를
+        # 직접 몬다 (아래 `one`). 발동 집합은 지형이 정한다 -- 게이트만 보면
+        # 정책이 아무 데서나 눌러 넘어지고 "절대 안 누른다"로 수렴한다.
+        yaw = path_enc.yaw_from_quat(state.data.qpos[3:7])
+        allow = skills.jump_allow(self.height, state.data.qpos[0:2], yaw,
+                                  self.shape) if self.skill_policies else             jnp.zeros(skills.N_GATES)
         skill = skills.update(info["skill"], act,
-                              self.env.get_gravity(state.data)[2],
-                              jnp.zeros(skills.N_GATES))
+                              self.env.get_gravity(state.data)[2], allow)
 
         # **명령을 스캔 밖에서 한 번만 넣는다.** 안에서 매번 `with_command` 를
         # 부르면 관측을 두 번 조립하게 된다 -- `with_command` 가 한 번, 바로 뒤
@@ -655,6 +687,12 @@ class Task(mjx_env.MjxEnv):
             llc, key = carry
             key, sub = jax.random.split(key)
             a, _ = self.llc_policy(llc.obs, sub)
+            # **켜진 스킬을 전부 굴리고 고른다.** 분기 대신 `where` 를 쓰는 이유는
+            # jit 안이라 `skill.active` 가 추적 값이기 때문이다. 신경망이
+            # 56->512->256->128 이라 물리에 비하면 공짜다.
+            for idx, pol in self.skill_policies:
+                a_s, _ = pol(llc.obs, sub)
+                a = jnp.where(skill.active == idx, a_s, a)
             llc = self.env.step(llc, a)
             return (llc, key), llc.done
 
@@ -885,8 +923,11 @@ def debug_video(task, policy, filename, rng=None, nsteps=MAX_STEPS,
     # 스텝마다 하나다. stride 1 이면 10 fps 이고 그보다 올릴 방법이 없다.
     # 더 부드럽게 하려면 LLC 서브스텝을 기록해야 하고, 그건 학습 경로의 메모리를
     # 5 배로 만들므로 녹화 전용 경로를 따로 내야 한다.
+    # `keep_texture` -- `paint_map` 으로 구운 바닥 그림을 깔았으면 `brighten` 이
+    # 흰 격자로 덮어쓰지 않게 알린다.
     save_video(task.env, frames, filename, fps=10, stride=stride,
-               height=height, width=width, camera=camera, route=route)
+               height=height, width=width, camera=camera, route=route,
+               keep_texture=getattr(task, "painted", False))
     return summary
 
 def reward_sanity(dist0=4.0, reach_steps=85, stall_steps=200, fall_step=20,

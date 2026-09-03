@@ -260,15 +260,32 @@ BRIGHT = {
     "grid_metres": 0.5,                # 격자 한 칸 (m)
     "grid_px": 64,                     # 텍스처 한 칸의 픽셀
     "grid_line_px": 2,                 # 선 두께. 64 px 에 2 px = 3 cm
+    # **맵 밖의 배경.** 이 씬에는 스카이박스가 없어서 지형 너머가 새까맣다.
+    # 발표 화면에서 대비가 너무 세고, 지형의 밝은 부분이 오려낸 종이처럼 뜬다.
+    # 안개 색을 옅은 하늘색으로 두면 배경이 그 색으로 채워진다.
+    # 안개로는 안 된다 -- 실측으로 `mjRND_FOG` 를 켜도 좌상단 픽셀이 (0,0,0)
+    # 그대로다. 안개는 **지오메트리에만** 걸리고 빈 곳은 검정으로 지운다.
+    # 스카이박스를 넣으려면 텍스처 슬롯이 더 필요해 모델을 다시 컴파일해야 한다.
+    # 그래서 렌더가 끝난 뒤 **정확히 검은 픽셀만** 이 색으로 바꾼다. 지형에서
+    # 제일 어두운 것이 절벽 `#1b1b1b` = (27,27,27) 이고 로봇은 회색이라, 순수
+    # (0,0,0) 은 배경뿐이다. 그림자도 꺼져 있다.
+    "background": (209, 219, 232),
 }
 
 
-def brighten(model):
-    """렌더용 밝은 사본. **물리에 영향이 없다.** 위 주석 참고."""
+def brighten(model, keep_texture: bool = False):
+    """렌더용 밝은 사본. **물리에 영향이 없다.** 위 주석 참고.
+
+    `keep_texture` -- 바닥 그림을 **그대로 둔다.** `paint_map` 으로 구운 지도를
+    `hlc_env.make(texture=)` 로 이미 깔아 둔 경우다. 이걸 안 주면 아래 코드가
+    그 위에 흰 격자를 다시 칠하고 `texuniform` 까지 되돌려서 구운 지도가 통째로
+    사라진다 -- 실제로 한 번 그렇게 나왔다. 조명만 손본다.
+    """
     import copy
     import mujoco
 
     m = copy.deepcopy(model)
+    # 배경색. 빈 곳을 안개 색이 채운다.
     h = m.vis.headlight
     h.ambient[:] = BRIGHT["headlight_ambient"]
     h.diffuse[:] = BRIGHT["headlight_diffuse"]
@@ -288,6 +305,8 @@ def brighten(model):
             continue
         m.mat_reflectance[mat] = BRIGHT["ground_reflect"]
         m.mat_rgba[mat] = BRIGHT["ground_rgba"]
+        if keep_texture:
+            continue
         # **`texrepeat` 은 지형 전체의 반복 수가 아니라 미터당 반복 수다.**
         # 이 재질은 `texuniform = 1` 이라 월드 단위로 매핑된다. 지형 폭(448 m)을
         # 넣었더니 미터당 448 번이 되어 화면이 모아레로 덮였다. 한 칸을 1 m 로
@@ -427,7 +446,7 @@ def _camera(model, kind, data=None):
 
 
 def render_frames(env, states, camera="track", height=480, width=640,
-                  bright=True, route=None):
+                  bright=True, route=None, keep_texture=False):
     """상태 목록 -> 이미지 목록. **playground 의 `render_array` 를 대체한다.**
 
     왜 직접 쓰는가
@@ -457,7 +476,8 @@ def render_frames(env, states, camera="track", height=480, width=640,
     """
     import mujoco
 
-    m = brighten(env.mj_model) if bright else env.mj_model
+    m = brighten(env.mj_model, keep_texture) if bright else env.mj_model
+    bg = np.asarray(BRIGHT["background"], np.uint8) if bright else None
     # 선은 잘게 나누므로 점 수보다 훨씬 많다. 경로 길이 / 간격 만큼 잡는다.
     n_extra = 0
     if route is not None:
@@ -479,14 +499,19 @@ def render_frames(env, states, camera="track", height=480, width=640,
             renderer.update_scene(d, camera=_camera(m, camera, d))
             if route is not None:
                 _draw_route(m, renderer.scene, route)
-            out.append(renderer.render())
+            img = renderer.render()
+            if bg is not None:
+                img = img.copy()
+                img[np.all(img == 0, axis=-1)] = bg   # 배경만. 위 주석 참고
+            out.append(img)
     finally:
         renderer.close()
     return out
 
 
 def save_video(env, states, filename, fps=50, stride=1, camera="track",
-               height=480, width=640, bright=True, route=None):
+               height=480, width=640, bright=True, route=None,
+               keep_texture=False):
     """영상 저장. 세 단계로 물러난다.
 
         1  mediapy         PATH 의 ffmpeg 을 쓴다. 콜랩은 여기서 끝난다
@@ -512,7 +537,7 @@ def save_video(env, states, filename, fps=50, stride=1, camera="track",
     # 어두웠다. **원인은 헤드라이트가 아니라 지형 재질과 조명 ambient 였다.**
     rendered = render_frames(env, states[::stride], camera=camera,
                              height=height, width=width, bright=bright,
-                             route=route)
+                             route=route, keep_texture=keep_texture)
     out_fps = max(fps // stride, 1)
 
     try:
@@ -850,6 +875,62 @@ KIND_COLOR = {
 }
 
 
+#: 바닥 그림의 격자선. `plot_map` 의 색과 같은 계열로 맞춘다.
+PAINT_GRID = (150, 160, 178)
+
+
+#: 3D 바닥에 쓸 때 `KIND_COLOR` 를 덮어쓰는 색.
+#:
+#: `plot_map` 의 색은 **종이 위 지도**용이라 평지가 거의 흰색(#e8e8e8)이다.
+#: 그 값을 3D 바닥에 그대로 깔면 조명을 받아 날아가고, 그 위에서 다른 색이
+#: 안 읽힌다. 평지만 눌러서 나머지가 살게 한다.
+PAINT_OVERRIDE = {maze.FLAT: "#c9cfd6"}
+
+
+def paint_map(mz, plan=None, *, px_per_tile: int = 16, grid_m: float = 1.0):
+    """미로를 **바닥 텍스처 한 장**으로 굽는다. `hlc_env.make(texture=)` 에 넣는다.
+
+    발표용이다. 지금 렌더는 지형 전체가 단색이라 경사도 돌도 다리도 구분이 안
+    된다. 랜드마다 색을 주면 영상과 `plot_map` 의 지도가 **같은 색**이 되어,
+    보는 사람이 둘을 이어서 읽을 수 있다.
+
+    **물리에는 영향이 없다.** 텍스처는 시각 자산이고 mjx 모델에 안 실린다
+    (`brighten` 머리말과 같은 이유). 그래서 이 그림을 켠 판과 안 켠 판의
+    측정값이 같아야 한다.
+
+    `px_per_tile` -- 랜드 하나가 몇 픽셀인가. 10 x 224 면 16 픽셀에 160 x 3584 다.
+    키우면 격자선이 매끈해지고 파일이 커진다.
+    """
+    from PIL import Image, ImageDraw
+
+    kind = np.asarray(mz.kind)
+    ty, tx = kind.shape
+    n = int(px_per_tile)
+    img = Image.new("RGB", (tx * n, ty * n), PAINT_OVERRIDE[maze.FLAT])
+    px = img.load()
+    # 랜드 색. `plot_map` 과 같은 표를 쓴다 -- 두 그림의 색이 어긋나면 안 된다.
+    rgb = {k: tuple(int(v.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+           for k, v in {**KIND_COLOR, **PAINT_OVERRIDE}.items()}
+    for r in range(ty):
+        for c in range(tx):
+            col = rgb.get(int(kind[r, c]), (200, 200, 200))
+            for i in range(r * n, (r + 1) * n):
+                for j in range(c * n, (c + 1) * n):
+                    px[j, i] = col
+
+    d = ImageDraw.Draw(img)
+    # **경로는 여기 안 그린다.** `_draw_route` 가 3D 선으로 그린다 -- 지형을
+    # 따라 휘고 굵기가 원근을 타서 바닥에 인쇄한 것보다 훨씬 잘 읽힌다.
+    # 1 m 격자. 거리를 읽는 눈금이라 리본 위에도 얹는다.
+    step = grid_m / maze.TILE * n
+    for j in range(int(tx * n / step) + 1):
+        x = j * step
+        d.line([(x, 0), (x, ty * n)], fill=PAINT_GRID, width=1)
+    for i in range(int(ty * n / step) + 1):
+        y = i * step
+        d.line([(0, y), (tx * n, y)], fill=PAINT_GRID, width=1)
+    return np.asarray(img, dtype=np.uint8)
+
 def plot_map(mz, plan=None, filename=None, *, title=None, dpi=140,
              lanes=None, zoom=None, scale=0.62):
     """미로를 위에서 본 그림. **정답지와 출발점을 같이 찍는다.**
@@ -973,6 +1054,148 @@ def plot_map(mz, plan=None, filename=None, *, title=None, dpi=140,
     fig.savefig(filename, dpi=dpi)
     plt.close(fig)
     print(f"  지도 {filename.name}")
+    return filename
+
+
+def plot_scan(filename=None, *, dpi=160):
+    """관측 스캔 배치 도식. **보고서 그림 전용이다.**
+
+    측정이 아니라 설명을 위한 그림이라 실제 지형을 쓰지 않는다. 대신 상수는
+    전부 `obs` 에서 읽어 온다 -- 손으로 적으면 상수가 바뀌었을 때 그림만 틀린
+    채로 남는다.
+
+    두 칸으로 그린다. 위는 평면 배치, 아래는 옆에서 본 단면이다.
+
+    **아래 칸이 이 그림의 요점이다.** 두 스캔이 같은 격자를 쓰면서 기준이
+    다르다는 것을 말로 쓰면 길고, 단면 한 컷이면 바로 보인다.
+
+        지형 스캔   발밑 지면이 기준     "땅이 솟았나"
+        천장 스캔   몸통 원점이 기준     "머리가 닿나"
+
+    기준을 같이 두면 안 되는 이유 -- 몸통 높이는 HLC 가 직접 명령하는 값이다.
+    몸통 기준으로 지형을 재면 "내가 몸을 낮춘 것" 과 "땅이 솟은 것" 이 같은
+    숫자가 된다 (`obs.terrain_scan` 주석).
+
+    라벨은 **영어로만** 쓴다. 그래프에 한글을 넣으면 글꼴이 없는 자리에서
+    두부가 되고, 보고서는 어느 기계에서 열릴지 모른다.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle, FancyArrowPatch
+
+    from . import obs as _obs
+
+    off = np.asarray(_obs.scan_offsets())
+    fx = np.unique(off[:, 0])
+    fy = np.unique(off[:, 1])
+
+    fig, (ax, bx) = plt.subplots(2, 1, figsize=(9.0, 7.4),
+                                 gridspec_kw={"height_ratios": [1.25, 1.0]})
+
+    # ---- 위 칸. 평면 배치 ----
+    ax.add_patch(Rectangle((-0.35, -0.16), 0.70, 0.32, facecolor="0.80",
+                           edgecolor="0.35", zorder=1))
+    # 진행 방향 화살표는 **격자 밖에** 둔다. 격자 안에 그리면 점을 덮는다
+    ax.annotate("", xy=(0.55, fy[-1] + 0.20), xytext=(0.05, fy[-1] + 0.20),
+                zorder=4, arrowprops=dict(arrowstyle="-|>", lw=1.6, color="0.20"))
+    ax.text(0.60, fy[-1] + 0.20, "heading", ha="left", va="center",
+            fontsize=9, color="0.20")
+    ax.scatter(off[:, 0], off[:, 1], s=13, color="#1f77b4", zorder=3,
+               label=f"scan points  {_obs.SCAN_NX} x {_obs.SCAN_NY} = {_obs.SCAN_SIZE}")
+    # 랜드 한 칸 경계. 앞으로 2.0 m 를 보는 근거가 이것이다.
+    ax.axvline(maze.TILE, color="#d62728", ls="--", lw=1.2, zorder=2)
+    ax.text(maze.TILE - 0.04, _obs.SCAN_LAT[1] + 0.10,
+            f"next tile edge  {maze.TILE:.1f} m", ha="right", fontsize=8.5,
+            color="#d62728")
+    ax.annotate("", xy=(fx[0], -0.86), xytext=(0.0, -0.86),
+                arrowprops=dict(arrowstyle="<->", lw=1.0, color="0.35"))
+    ax.text(fx[0] / 2, -0.96, f"{abs(fx[0]):.1f} m behind", ha="center",
+            fontsize=8.5, color="0.35")
+    ax.annotate("", xy=(fx[0], fy[0]), xytext=(fx[0], fy[-1]),
+                arrowprops=dict(arrowstyle="<->", lw=1.0, color="0.35"))
+    ax.text(fx[0] - 0.10, 0.0, f"{fy[-1] - fy[0]:.1f} m", rotation=90,
+            va="center", ha="right", fontsize=8.5, color="0.35")
+    ax.annotate("", xy=(fx[0], fy[-1] + 0.14), xytext=(fx[1], fy[-1] + 0.14),
+                arrowprops=dict(arrowstyle="<->", lw=1.0, color="0.35"))
+    ax.text((fx[0] + fx[1]) / 2, fy[-1] + 0.20,
+            f"{_obs.SCAN_STEP:.1f} m", ha="center", fontsize=8.5, color="0.35")
+    ax.set_xlim(fx[0] - 0.45, fx[-1] + 0.30)
+    ax.set_ylim(-1.10, fy[-1] + 0.46)
+    ax.set_aspect("equal")
+    ax.set_xlabel("forward (m, robot frame)")
+    ax.set_ylabel("lateral (m)")
+    ax.set_title("Scan grid in robot frame  (terrain and ceiling share it)",
+                 fontsize=10.5)
+    ax.legend(loc="lower right", fontsize=8.5, framealpha=0.9)
+    ax.grid(alpha=0.25, lw=0.5)
+
+    # ---- 아래 칸. 옆에서 본 단면 ----
+    # 설명용 지형. 앞쪽에 단이 하나 오르고 그 위에 터널이 얹힌다.
+    gx = np.linspace(fx[0], fx[-1], 400)
+    ground = np.where(gx < 0.9, 0.0, 0.18)
+    body_z = 0.30                       # 몸통 원점 높이 (m). 그림용 대표값
+    tun_lo, tun_hi = 1.15, 1.95         # 터널이 덮는 구간
+    ceil_z = 0.18 + maze.TUNNEL_CLEAR   # 터널 바닥면 = 그 자리 지면 + 여유고
+
+    bx.fill_between(gx, -0.12, ground, color="0.86", edgecolor="0.45", lw=1.0)
+    bx.add_patch(Rectangle((tun_lo, ceil_z), tun_hi - tun_lo, 0.10,
+                           facecolor="#c9b7dd", edgecolor="0.45", lw=1.0))
+    bx.text((tun_lo + tun_hi) / 2, ceil_z + 0.15, "tunnel ceiling",
+            ha="center", fontsize=8.5, color="0.30")
+
+    # 몸통과 두 기준선
+    bx.add_patch(Rectangle((-0.35, body_z - 0.06), 0.70, 0.12,
+                           facecolor="0.80", edgecolor="0.35", zorder=3))
+    bx.axhline(0.0, color="#2ca02c", ls="--", lw=1.1)
+    bx.text(fx[0] - 0.02, 0.052, "ground under robot  (terrain reference)",
+            fontsize=8.5, color="#2ca02c")
+    bx.axhline(body_z, color="#d62728", ls="--", lw=1.1)
+    bx.text(fx[-1] + 0.25, body_z + 0.015, "body origin  (ceiling reference)",
+            fontsize=8.5, color="#d62728", ha="right")
+
+    # 스캔 표본. 중앙 열(lateral 0)만 그린다
+    gs = np.interp(fx, gx, ground)
+    bx.scatter(fx, gs, s=22, color="#1f77b4", zorder=4)
+    inside = (fx >= tun_lo) & (fx <= tun_hi)
+    bx.scatter(fx[inside], np.full(inside.sum(), ceil_z), s=22,
+               marker="v", color="#9467bd", zorder=4)
+
+    # 무엇을 재는가. 화살표 두 개
+    i = int(np.argmin(np.abs(fx - 1.4)))
+    bx.add_patch(FancyArrowPatch((fx[i], 0.0), (fx[i], gs[i]),
+                                 arrowstyle="<->", mutation_scale=11,
+                                 color="#1f77b4", lw=1.3, zorder=5))
+    bx.text(fx[i] + 0.06, gs[i] / 2, "terrain scan\nheight above ground",
+            fontsize=8.5, color="#1f77b4", va="center")
+    bx.add_patch(FancyArrowPatch((fx[i] - 0.42, body_z),
+                                 (fx[i] - 0.42, ceil_z),
+                                 arrowstyle="<->", mutation_scale=11,
+                                 color="#9467bd", lw=1.3, zorder=5))
+    bx.text(fx[i] - 0.48, (body_z + ceil_z) / 2,
+            "ceiling scan\nclearance above body", fontsize=8.5,
+            color="#9467bd", va="center", ha="right")
+
+    bx.set_xlim(fx[0] - 0.45, fx[-1] + 0.30)
+    bx.set_ylim(-0.12, 0.86)
+    bx.set_xlabel("forward (m, robot frame)")
+    bx.set_ylabel("height (m)")
+    bx.set_title("Side view  -  same grid, different reference", fontsize=10.5)
+    bx.grid(alpha=0.25, lw=0.5)
+
+    fig.suptitle(
+        f"Terrain scan {_obs.SCAN_SIZE} + ceiling scan {_obs.CEIL_SIZE}"
+        f"   (clipped to +-{_obs.SCAN_CLIP:.1f} m)", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+
+    if filename is None:
+        from .. import paths
+        filename = paths.outputs("그림") / "스캔배치.png"
+    filename = Path(filename)
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(filename, dpi=dpi)
+    plt.close(fig)
+    print(f"  그림 {filename.name}")
     return filename
 
 
@@ -1205,6 +1428,109 @@ def ramp_table(rows) -> str:
         out.append(f"  {m}  " + "  ".join(cells))
     out += ["", "  X 는 넘어짐. 등반은 x, 횡단은 y 방향 전진."]
     return "\n".join(out)
+
+
+#: `ramp_test` 와 `ramp_video` 가 함께 쓰는 출발 방향. 경사는 +x 로 오르므로
+#: 북(+y)을 보면 오르막이 오른쪽, 남(-y)을 보면 왼쪽이다.
+RAMP_HEADING = {"등반": 0.0, "횡단·오른쪽오르막": np.pi / 2,
+                "횡단·왼쪽오르막": -np.pi / 2}
+
+
+def ramp_video(out_dir=None, *, modes=("횡단·왼쪽오르막", "횡단·오른쪽오르막"),
+               speed: float = 0.6, deg=None, lands_width: int = 7,
+               nsteps: int = 400, seed: int = 0, stride: int = 2,
+               px=(640, 480), checkpoint=None):
+    """`ramp_test` 와 **같은 지형·같은 명령**으로 굴리고 영상을 남긴다.
+
+    표(`ramp_test`)가 낸 숫자를 눈으로 확인하는 그림이다. 측정과 영상이 다른
+    틀에서 나오면 둘을 나란히 놓을 수 없으므로 지형 생성과 출발 조건을 그대로
+    맞춘다 -- 다르게 두면 "영상은 넘어지는데 표는 안 넘어진다" 가 생긴다.
+
+    `deg` 를 주면 그 각도로 **경사만** 갈아끼운다. `maze.ELEVATION` 은 고정
+    상수라 따라오지 않고, 따라서 `SPAN` 이 그대로다 -- 관측 서명이 안 바뀐다
+    (`maze.ELEVATION` 주석).
+
+    **`deg` 는 이 프로세스의 `maze.HIGH` 를 바꾼다.** 끝나면 되돌리므로 이어지는
+    호출에는 영향이 없지만, 같은 프로세스에서 다른 측정을 병행하지 말 것.
+
+    반환값 -- 저장한 경로 목록.
+    """
+    import math
+
+    ckpt = checkpoint
+    if ckpt is None:
+        from .. import paths
+        ckpt = paths.llc()
+    if out_dir is None:
+        from .. import paths
+        out_dir = paths.outputs("그림")
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    keep = maze.HIGH
+    try:
+        if deg is not None:
+            maze.HIGH = ((maze.CELLS_PER_TILE - 1) * maze.CELL
+                         * math.tan(math.radians(float(deg))))
+            assert maze.ELEVATION >= maze.LEVEL_MAX * maze.HIGH + maze.WALL_HEIGHT
+            print(f"  경사 {deg}도  단 높이 {maze.HIGH:.4f} m", flush=True)
+
+        height, _, plan = lands.obstacle_corridor(
+            maze.RAMP, level_after=1, axis=maze.RUN_X, width=int(lands_width))
+        env = hlc_env.make(terrain=height)
+        policy_fn = loader.load_policy(ckpt, loader.env_observation_size(env))
+        ex, ey = plan["extent"]
+        ramp_x = float(plan["obstacle_x"])
+        y0 = -ey / 2 + maze.TILE * 1.5
+
+        def ground_at(x, y):
+            h, w = height.shape
+            j = int(np.clip((x + ex / 2) / ex * w, 0, w - 1))
+            i = int(np.clip((y + ey / 2) / ey * h, 0, h - 1))
+            return float(height[i, j]) * maze.SPAN - maze.DEPTH
+
+        reset, step = jax.jit(env.reset_at), jax.jit(env.step)
+        with_command, infer = jax.jit(env.with_command), jax.jit(policy_fn)
+
+        saved = []
+        for mode in modes:
+            assert mode in RAMP_HEADING, (
+                f"모르는 방식 {mode}. {tuple(RAMP_HEADING)} 중에서 고르세요")
+            xy = (0.0, 0.0) if mode == "등반" else (
+                ramp_x, y0 if "오른쪽" in mode else -y0)
+            command = list(spec.BASE_VECTOR)
+            command[spec.index("vx")] = float(speed)
+            cmd = jnp.asarray(command, jnp.float32)
+
+            key = jax.random.PRNGKey(int(seed))
+            key, sub = jax.random.split(key)
+            state = with_command(
+                reset(sub, xy=tuple(float(v) for v in xy),
+                      yaw=float(RAMP_HEADING[mode]), z_offset=ground_at(*xy)),
+                cmd)
+
+            states, fell = [state], -1
+            for i in range(nsteps):
+                key, sub = jax.random.split(key)
+                action, _ = infer(state.obs, sub)
+                state = with_command(step(state, action), cmd)
+                states.append(state)
+                if bool(state.done) and i > SETTLE:
+                    fell = i
+                    break
+
+            tag = mode.replace("·", "_")
+            mark = "넘어짐" if fell >= 0 else "버팀"
+            angle = f"{deg:g}도" if deg is not None else "기본"
+            name = f"경사{angle}_{tag}_vx{speed:g}_{mark}.mp4"
+            print(f"  {mode}  vx {speed}  {mark}  {len(states)}스텝", flush=True)
+            saved.append(save_video(env, states, out_dir / name,
+                                    fps=50, stride=stride, camera="track",
+                                    height=int(px[1]), width=int(px[0])))
+        del env
+        return saved
+    finally:
+        maze.HIGH = keep
 
 
 def weights_from(rows, *, floor: float = 0.5, ceiling: float = 3.0):
